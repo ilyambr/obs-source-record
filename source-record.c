@@ -22,7 +22,7 @@
 
 #define BACKGROUND_CHANNEL 0
 #define SOURCE_CHANNEL 1
-#define OVERLAY_CHANNEL_BASE 2
+#define OVERLAY_CHANNEL 2
 #define MAX_OVERLAY_SOURCES 4
 
 struct source_record_filter_context {
@@ -34,6 +34,7 @@ struct source_record_filter_context {
 	uint32_t height;
 	uint64_t last_frame_time_ns;
 	obs_view_t *view;
+	obs_scene_t *overlay_scene;
 	bool starting_file_output;
 	bool starting_stream_output;
 	bool starting_replay_output;
@@ -906,29 +907,74 @@ static void update_encoder(struct source_record_filter_context *filter, obs_data
 	filter->audio_track_mask = audio_track_mask;
 }
 
+/* Rebuilds the private overlay scene from the reference scene's items, copying
+ * each item's real position/scale/bounds/crop so it lines up the same way it
+ * does in the reference scene, rescaled from the OBS canvas to this filter's
+ * own (usually differently sized) output canvas. */
 static void update_overlay_sources(struct source_record_filter_context *filter, obs_data_t *settings)
 {
-	char prop_name[24];
-	for (int i = 0; i < MAX_OVERLAY_SOURCES; i++) {
-		snprintf(prop_name, sizeof(prop_name), "overlay_source_%d", i + 1);
-		const char *source_name = obs_data_get_string(settings, prop_name);
-		const int channel = OVERLAY_CHANNEL_BASE + i;
-		obs_source_t *view_source = obs_view_get_source(filter->view, channel);
-		if (!source_name || !strlen(source_name)) {
-			if (view_source)
-				obs_view_set_source(filter->view, channel, NULL);
-		} else if (!view_source || strcmp(source_name, obs_source_get_name(view_source)) != 0) {
-			obs_source_t *source = obs_get_source_by_name(source_name);
-			if (source) {
-				obs_view_set_source(filter->view, channel, source);
-				obs_source_release(source);
-			} else {
-				obs_view_set_source(filter->view, channel, NULL);
-			}
+	const char *scene_name = obs_data_get_string(settings, "overlay_scene");
+	obs_source_t *ref_source = (scene_name && strlen(scene_name)) ? obs_get_source_by_name(scene_name) : NULL;
+	obs_scene_t *ref_scene = ref_source ? obs_scene_from_source(ref_source) : NULL;
+
+	obs_scene_t *new_scene = obs_scene_create_private("Source Record Overlay");
+
+	if (ref_scene) {
+		struct obs_video_info ovi = {0};
+		obs_get_video_info(&ovi);
+		const float sx = (ovi.base_width && filter->width) ? (float)filter->width / (float)ovi.base_width : 1.0f;
+		const float sy = (ovi.base_height && filter->height) ? (float)filter->height / (float)ovi.base_height : 1.0f;
+
+		char prop_name[24];
+		for (int i = 1; i <= MAX_OVERLAY_SOURCES; i++) {
+			snprintf(prop_name, sizeof(prop_name), "overlay_source_%d", i);
+			const char *item_name = obs_data_get_string(settings, prop_name);
+			if (!item_name || !strlen(item_name))
+				continue;
+			obs_sceneitem_t *ref_item = obs_scene_find_source(ref_scene, item_name);
+			if (!ref_item)
+				continue;
+			obs_source_t *item_source = obs_sceneitem_get_source(ref_item);
+			if (!item_source)
+				continue;
+
+			obs_sceneitem_t *new_item = obs_scene_add(new_scene, item_source);
+			if (!new_item)
+				continue;
+
+			struct vec2 pos, scale, bounds;
+			obs_sceneitem_get_pos(ref_item, &pos);
+			obs_sceneitem_get_scale(ref_item, &scale);
+			obs_sceneitem_get_bounds(ref_item, &bounds);
+			pos.x *= sx;
+			pos.y *= sy;
+			scale.x *= sx;
+			scale.y *= sy;
+			bounds.x *= sx;
+			bounds.y *= sy;
+
+			obs_sceneitem_set_rot(new_item, obs_sceneitem_get_rot(ref_item));
+			obs_sceneitem_set_alignment(new_item, obs_sceneitem_get_alignment(ref_item));
+			obs_sceneitem_set_bounds_type(new_item, obs_sceneitem_get_bounds_type(ref_item));
+			obs_sceneitem_set_bounds_alignment(new_item, obs_sceneitem_get_bounds_alignment(ref_item));
+			obs_sceneitem_set_bounds(new_item, &bounds);
+			obs_sceneitem_set_scale(new_item, &scale);
+			obs_sceneitem_set_pos(new_item, &pos);
+
+			struct obs_sceneitem_crop crop;
+			obs_sceneitem_get_crop(ref_item, &crop);
+			obs_sceneitem_set_crop(new_item, &crop);
 		}
-		if (view_source)
-			obs_source_release(view_source);
 	}
+
+	if (ref_source)
+		obs_source_release(ref_source);
+
+	obs_view_set_source(filter->view, OVERLAY_CHANNEL, obs_scene_get_source(new_scene));
+
+	if (filter->overlay_scene)
+		obs_scene_release(filter->overlay_scene);
+	filter->overlay_scene = new_scene;
 }
 
 static void source_record_filter_update(void *data, obs_data_t *settings)
@@ -1324,14 +1370,18 @@ static void source_record_filter_destroy(void *data)
 	if (context->view) {
 		obs_view_set_source(context->view, BACKGROUND_CHANNEL, NULL);
 		obs_view_set_source(context->view, SOURCE_CHANNEL, NULL);
-		for (int i = 0; i < MAX_OVERLAY_SOURCES; i++)
-			obs_view_set_source(context->view, OVERLAY_CHANNEL_BASE + i, NULL);
+		obs_view_set_source(context->view, OVERLAY_CHANNEL, NULL);
 		if (context->video_output) {
 			obs_view_remove(context->view);
 			context->video_output = NULL;
 		}
 		obs_view_destroy(context->view);
 		context->view = NULL;
+	}
+
+	if (context->overlay_scene) {
+		obs_scene_release(context->overlay_scene);
+		context->overlay_scene = NULL;
 	}
 
 	context->source = NULL;
@@ -1723,6 +1773,44 @@ static bool list_add_video_sources(void *data, obs_source_t *source)
 	return true;
 }
 
+static bool list_add_scene_item(obs_scene_t *scene, obs_sceneitem_t *item, void *data)
+{
+	UNUSED_PARAMETER(scene);
+	obs_property_t *p = data;
+	obs_source_t *source = obs_sceneitem_get_source(item);
+	if (!source)
+		return true;
+	const uint32_t flags = obs_source_get_output_flags(source);
+	if ((flags & OBS_SOURCE_VIDEO) != 0)
+		obs_property_list_add_string(p, obs_source_get_name(source), obs_source_get_name(source));
+	return true;
+}
+
+static bool overlay_scene_changed(void *data, obs_properties_t *props, obs_property_t *property, obs_data_t *settings)
+{
+	UNUSED_PARAMETER(data);
+	UNUSED_PARAMETER(property);
+	const char *scene_name = obs_data_get_string(settings, "overlay_scene");
+	obs_source_t *scene_source = (scene_name && strlen(scene_name)) ? obs_get_source_by_name(scene_name) : NULL;
+	obs_scene_t *scene = scene_source ? obs_scene_from_source(scene_source) : NULL;
+
+	char prop_name[24];
+	for (int i = 1; i <= MAX_OVERLAY_SOURCES; i++) {
+		snprintf(prop_name, sizeof(prop_name), "overlay_source_%d", i);
+		obs_property_t *p = obs_properties_get(props, prop_name);
+		if (!p)
+			continue;
+		obs_property_list_clear(p);
+		obs_property_list_add_string(p, obs_module_text("None"), "");
+		if (scene)
+			obs_scene_enum_items(scene, list_add_scene_item, p);
+	}
+
+	if (scene_source)
+		obs_source_release(scene_source);
+	return true;
+}
+
 static bool source_record_split_button(obs_properties_t *props, obs_property_t *property, void *data)
 {
 	UNUSED_PARAMETER(props);
@@ -1831,6 +1919,13 @@ static obs_properties_t *source_record_filter_properties(void *data)
 	obs_properties_add_group(props, "background", obs_module_text("Background"), OBS_GROUP_NORMAL, background);
 
 	obs_properties_t *overlays = obs_properties_create();
+	p = obs_properties_add_list(overlays, "overlay_scene", obs_module_text("OverlayScene"), OBS_COMBO_TYPE_LIST,
+				    OBS_COMBO_FORMAT_STRING);
+	obs_property_list_add_string(p, obs_module_text("None"), "");
+	obs_enum_scenes(list_add_video_sources, p);
+	obs_property_set_long_description(p, obs_module_text("OverlaySceneNote"));
+	obs_property_set_modified_callback2(p, overlay_scene_changed, data);
+
 	for (int i = 1; i <= MAX_OVERLAY_SOURCES; i++) {
 		char prop_name[24];
 		snprintf(prop_name, sizeof(prop_name), "overlay_source_%d", i);
@@ -1839,8 +1934,6 @@ static obs_properties_t *source_record_filter_properties(void *data)
 		obs_property_t *overlay_list =
 			obs_properties_add_list(overlays, prop_name, buffer, OBS_COMBO_TYPE_EDITABLE, OBS_COMBO_FORMAT_STRING);
 		obs_property_list_add_string(overlay_list, obs_module_text("None"), "");
-		obs_enum_sources(list_add_video_sources, overlay_list);
-		obs_enum_scenes(list_add_video_sources, overlay_list);
 	}
 	obs_properties_add_group(props, "overlays", obs_module_text("AdditionalSources"), OBS_GROUP_NORMAL, overlays);
 
