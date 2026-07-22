@@ -19,3 +19,7 @@ https://obsproject.com/forum/resources/source-record.1285/
 
 # Donations
 https://www.paypal.me/exeldro
+
+# Changes
+added more advanced multitrack audio
+-ilyambr and claude fucking code:)
