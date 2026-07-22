@@ -22,6 +22,8 @@
 
 #define BACKGROUND_CHANNEL 0
 #define SOURCE_CHANNEL 1
+#define OVERLAY_CHANNEL_BASE 2
+#define MAX_OVERLAY_SOURCES 4
 
 struct source_record_filter_context {
 	obs_source_t *source;
@@ -904,6 +906,31 @@ static void update_encoder(struct source_record_filter_context *filter, obs_data
 	filter->audio_track_mask = audio_track_mask;
 }
 
+static void update_overlay_sources(struct source_record_filter_context *filter, obs_data_t *settings)
+{
+	char prop_name[24];
+	for (int i = 0; i < MAX_OVERLAY_SOURCES; i++) {
+		snprintf(prop_name, sizeof(prop_name), "overlay_source_%d", i + 1);
+		const char *source_name = obs_data_get_string(settings, prop_name);
+		const int channel = OVERLAY_CHANNEL_BASE + i;
+		obs_source_t *view_source = obs_view_get_source(filter->view, channel);
+		if (!source_name || !strlen(source_name)) {
+			if (view_source)
+				obs_view_set_source(filter->view, channel, NULL);
+		} else if (!view_source || strcmp(source_name, obs_source_get_name(view_source)) != 0) {
+			obs_source_t *source = obs_get_source_by_name(source_name);
+			if (source) {
+				obs_view_set_source(filter->view, channel, source);
+				obs_source_release(source);
+			} else {
+				obs_view_set_source(filter->view, channel, NULL);
+			}
+		}
+		if (view_source)
+			obs_source_release(view_source);
+	}
+}
+
 static void source_record_filter_update(void *data, obs_data_t *settings)
 {
 	struct source_record_filter_context *filter = data;
@@ -978,6 +1005,8 @@ static void source_record_filter_update(void *data, obs_data_t *settings)
 		}
 		obs_data_release(css);
 		obs_source_release(background_source);
+
+		update_overlay_sources(filter, settings);
 	}
 
 	if (record != filter->record) {
@@ -1295,6 +1324,8 @@ static void source_record_filter_destroy(void *data)
 	if (context->view) {
 		obs_view_set_source(context->view, BACKGROUND_CHANNEL, NULL);
 		obs_view_set_source(context->view, SOURCE_CHANNEL, NULL);
+		for (int i = 0; i < MAX_OVERLAY_SOURCES; i++)
+			obs_view_set_source(context->view, OVERLAY_CHANNEL_BASE + i, NULL);
 		if (context->video_output) {
 			obs_view_remove(context->view);
 			context->video_output = NULL;
@@ -1547,6 +1578,8 @@ static void source_record_filter_tick(void *data, float seconds)
 		obs_data_release(css);
 		obs_source_release(background_source);
 
+		update_overlay_sources(context, s);
+
 		if (context->record)
 			start_file_output(context, s);
 		if (context->stream)
@@ -1681,6 +1714,15 @@ static bool list_add_audio_sources(void *data, obs_source_t *source)
 	return true;
 }
 
+static bool list_add_video_sources(void *data, obs_source_t *source)
+{
+	obs_property_t *p = data;
+	const uint32_t flags = obs_source_get_output_flags(source);
+	if ((flags & OBS_SOURCE_VIDEO) != 0)
+		obs_property_list_add_string(p, obs_source_get_name(source), obs_source_get_name(source));
+	return true;
+}
+
 static bool source_record_split_button(obs_properties_t *props, obs_property_t *property, void *data)
 {
 	UNUSED_PARAMETER(props);
@@ -1787,6 +1829,20 @@ static obs_properties_t *source_record_filter_properties(void *data)
 	obs_properties_add_color(background, "backgroundColor", obs_module_text("BackgroundColor"));
 
 	obs_properties_add_group(props, "background", obs_module_text("Background"), OBS_GROUP_NORMAL, background);
+
+	obs_properties_t *overlays = obs_properties_create();
+	for (int i = 1; i <= MAX_OVERLAY_SOURCES; i++) {
+		char prop_name[24];
+		snprintf(prop_name, sizeof(prop_name), "overlay_source_%d", i);
+		char buffer[64];
+		snprintf(buffer, 64, "%s %i", obs_module_text("Overlay"), i);
+		obs_property_t *overlay_list =
+			obs_properties_add_list(overlays, prop_name, buffer, OBS_COMBO_TYPE_EDITABLE, OBS_COMBO_FORMAT_STRING);
+		obs_property_list_add_string(overlay_list, obs_module_text("None"), "");
+		obs_enum_sources(list_add_video_sources, overlay_list);
+		obs_enum_scenes(list_add_video_sources, overlay_list);
+	}
+	obs_properties_add_group(props, "overlays", obs_module_text("AdditionalSources"), OBS_GROUP_NORMAL, overlays);
 
 	obs_properties_t *audio = obs_properties_create();
 
