@@ -58,6 +58,7 @@ struct source_record_filter_context {
 	bool closing;
 	bool exiting;
 	long long replay_buffer_duration;
+	bool replay_error;
 	struct vec4 backgroundColor;
 	bool remove_after_record;
 	long long record_max_seconds;
@@ -361,6 +362,80 @@ static void source_record_replay_saved(void *data, calldata_t *cd)
 	obs_websocket_vendor_emit_event(vendor, "replay_buffer_saved", event_data);
 	obs_data_release(event_data);
 	bfree(path_fallback);
+}
+
+static void source_record_replay_stopped(void *data, calldata_t *cd)
+{
+	struct source_record_filter_context *context = data;
+	const long long code = calldata_int(cd, "code");
+	context->replay_error = code != OBS_OUTPUT_SUCCESS;
+}
+
+struct find_output_hotkey_ctx {
+	obs_output_t *target;
+	obs_hotkey_id id;
+};
+
+static bool find_output_hotkey_cb(void *data, obs_hotkey_id id, obs_hotkey_t *key)
+{
+	struct find_output_hotkey_ctx *ctx = data;
+	if (obs_hotkey_get_registerer_type(key) != OBS_HOTKEY_REGISTERER_OUTPUT)
+		return true;
+	if (obs_hotkey_get_registerer(key) != (void *)ctx->target)
+		return true;
+	ctx->id = id;
+	return false;
+}
+
+struct find_hotkey_binding_ctx {
+	obs_hotkey_id id;
+	obs_key_combination_t combo;
+	bool found;
+};
+
+static bool find_hotkey_binding_cb(void *data, size_t idx, obs_hotkey_binding_t *binding)
+{
+	UNUSED_PARAMETER(idx);
+	struct find_hotkey_binding_ctx *ctx = data;
+	if (obs_hotkey_binding_get_hotkey_id(binding) != ctx->id)
+		return true;
+	ctx->combo = obs_hotkey_binding_get_key_combination(binding);
+	ctx->found = true;
+	return false;
+}
+
+/* Finds the (single) hotkey the "replay_buffer" output type registers for
+ * itself and writes its bound key combination (e.g. "F8") into `str`, or
+ * leaves `str` empty if the output has no hotkey or it is unbound. */
+static void get_output_hotkey_str(obs_output_t *output, struct dstr *str)
+{
+	dstr_free(str);
+	if (!output)
+		return;
+
+	struct find_output_hotkey_ctx find_ctx = {output, OBS_INVALID_HOTKEY_ID};
+	obs_enum_hotkeys(find_output_hotkey_cb, &find_ctx);
+	if (find_ctx.id == OBS_INVALID_HOTKEY_ID)
+		return;
+
+	struct find_hotkey_binding_ctx bind_ctx = {find_ctx.id, {0}, false};
+	obs_enum_hotkey_bindings(find_hotkey_binding_cb, &bind_ctx);
+	if (bind_ctx.found)
+		obs_key_combination_to_str(bind_ctx.combo, str);
+}
+
+static void get_replay_buffer_status_proc(void *data, calldata_t *cd)
+{
+	struct source_record_filter_context *context = data;
+	calldata_set_bool(cd, "enabled", context->replayBuffer);
+	calldata_set_bool(cd, "active", context->replayOutput && obs_output_active(context->replayOutput));
+	calldata_set_bool(cd, "error", context->replay_error);
+
+	struct dstr hotkey_str;
+	dstr_init(&hotkey_str);
+	get_output_hotkey_str(context->replayOutput, &hotkey_str);
+	calldata_set_string(cd, "hotkey", hotkey_str.array ? hotkey_str.array : "");
+	dstr_free(&hotkey_str);
 }
 
 void release_output_stopped(void *data, calldata_t *cd)
@@ -680,9 +755,12 @@ static void start_replay_output(struct source_record_filter_context *filter, obs
 		}
 
 		filter->replayOutput = obs_output_create("replay_buffer", name.array, s, hotkeys);
+		filter->replay_error = false;
 		signal_handler_t *sh = obs_output_get_signal_handler(filter->replayOutput);
-		if (sh)
+		if (sh) {
 			signal_handler_connect(sh, "saved", source_record_replay_saved, filter);
+			signal_handler_connect(sh, "stop", source_record_replay_stopped, filter);
+		}
 		if (filter->remove_after_record) {
 			sh = obs_output_get_signal_handler(filter->replayOutput);
 			signal_handler_connect(sh, "stop", remove_filter, filter);
@@ -1309,6 +1387,12 @@ static void *source_record_filter_create(obs_data_t *settings, obs_source_t *sou
 	context->pauseHotkeys = OBS_INVALID_HOTKEY_PAIR_ID;
 	context->splitHotkey = OBS_INVALID_HOTKEY_ID;
 	context->chapterHotkey = OBS_INVALID_HOTKEY_ID;
+
+	proc_handler_t *ph = obs_source_get_proc_handler(source);
+	if (ph)
+		proc_handler_add(ph, "void get_replay_buffer_status(out bool enabled, out bool active, out bool error, out string hotkey)",
+				 get_replay_buffer_status_proc, context);
+
 	source_record_filter_update(context, settings);
 	obs_frontend_add_event_callback(frontend_event, context);
 	return context;
