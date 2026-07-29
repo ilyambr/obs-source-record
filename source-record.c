@@ -455,6 +455,22 @@ static void get_replay_buffer_status_proc(void *data, calldata_t *cd)
 	dstr_free(&hotkey_str);
 }
 
+static void save_replay_buffer_proc(void *data, calldata_t *cd)
+{
+	struct source_record_filter_context *context = data;
+	bool success = false;
+	if (context->replayOutput) {
+		proc_handler_t *ph = obs_output_get_proc_handler(context->replayOutput);
+		if (ph) {
+			calldata_t inner_cd;
+			calldata_init(&inner_cd);
+			success = proc_handler_call(ph, "save", &inner_cd);
+			calldata_free(&inner_cd);
+		}
+	}
+	calldata_set_bool(cd, "success", success);
+}
+
 void release_output_stopped(void *data, calldata_t *cd)
 {
 	UNUSED_PARAMETER(cd);
@@ -1406,9 +1422,11 @@ static void *source_record_filter_create(obs_data_t *settings, obs_source_t *sou
 	context->chapterHotkey = OBS_INVALID_HOTKEY_ID;
 
 	proc_handler_t *ph = obs_source_get_proc_handler(source);
-	if (ph)
+	if (ph) {
 		proc_handler_add(ph, "void get_replay_buffer_status(out bool enabled, out bool active, out bool error, out string hotkey)",
 				 get_replay_buffer_status_proc, context);
+		proc_handler_add(ph, "void save_replay_buffer(out bool success)", save_replay_buffer_proc, context);
+	}
 
 	signal_handler_t *filter_sh = obs_source_get_signal_handler(source);
 	if (filter_sh)
