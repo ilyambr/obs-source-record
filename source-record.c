@@ -361,6 +361,17 @@ static void source_record_replay_saved(void *data, calldata_t *cd)
 
 	obs_websocket_vendor_emit_event(vendor, "replay_buffer_saved", event_data);
 	obs_data_release(event_data);
+
+	/* Plain (non-websocket-dependent) signal for other plugins to hook. */
+	signal_handler_t *filter_sh = obs_source_get_signal_handler(context->source);
+	if (filter_sh) {
+		calldata_t signal_cd;
+		calldata_init(&signal_cd);
+		calldata_set_string(&signal_cd, "path", emit_path);
+		signal_handler_signal(filter_sh, "replay_saved", &signal_cd);
+		calldata_free(&signal_cd);
+	}
+
 	bfree(path_fallback);
 }
 
@@ -1398,6 +1409,10 @@ static void *source_record_filter_create(obs_data_t *settings, obs_source_t *sou
 	if (ph)
 		proc_handler_add(ph, "void get_replay_buffer_status(out bool enabled, out bool active, out bool error, out string hotkey)",
 				 get_replay_buffer_status_proc, context);
+
+	signal_handler_t *filter_sh = obs_source_get_signal_handler(source);
+	if (filter_sh)
+		signal_handler_add(filter_sh, "void replay_saved(string path)");
 
 	source_record_filter_update(context, settings);
 	obs_frontend_add_event_callback(frontend_event, context);
