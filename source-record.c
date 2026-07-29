@@ -372,7 +372,10 @@ static void source_record_replay_stopped(void *data, calldata_t *cd)
 }
 
 struct find_output_hotkey_ctx {
-	obs_output_t *target;
+	/* obs_hotkey_register_output() stores the registerer as the output's weak
+	 * wrapper (obs_output_get_weak_output()), not the raw obs_output_t*, so
+	 * that's what has to be compared against here. */
+	obs_weak_output_t *target_weak;
 	obs_hotkey_id id;
 };
 
@@ -381,7 +384,7 @@ static bool find_output_hotkey_cb(void *data, obs_hotkey_id id, obs_hotkey_t *ke
 	struct find_output_hotkey_ctx *ctx = data;
 	if (obs_hotkey_get_registerer_type(key) != OBS_HOTKEY_REGISTERER_OUTPUT)
 		return true;
-	if (obs_hotkey_get_registerer(key) != (void *)ctx->target)
+	if (obs_hotkey_get_registerer(key) != (void *)ctx->target_weak)
 		return true;
 	ctx->id = id;
 	return false;
@@ -413,8 +416,11 @@ static void get_output_hotkey_str(obs_output_t *output, struct dstr *str)
 	if (!output)
 		return;
 
-	struct find_output_hotkey_ctx find_ctx = {output, OBS_INVALID_HOTKEY_ID};
+	obs_weak_output_t *weak_output = obs_output_get_weak_output(output);
+	struct find_output_hotkey_ctx find_ctx = {weak_output, OBS_INVALID_HOTKEY_ID};
 	obs_enum_hotkeys(find_output_hotkey_cb, &find_ctx);
+	if (weak_output)
+		obs_weak_output_release(weak_output);
 	if (find_ctx.id == OBS_INVALID_HOTKEY_ID)
 		return;
 
