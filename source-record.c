@@ -867,7 +867,7 @@ static void update_encoder(struct source_record_filter_context *filter, obs_data
 			struct dstr name;
 			dstr_init(&name);
 			for (int i = 0; i < MAX_AUDIO_MIXES; i++) {
-				dstr_printf(&name, "%s track %d", obs_source_get_name(filter->source), i + 1);
+				dstr_printf(&name, "%s %d", obs_module_text("Track"), i + 1);
 				filter->audioEncoder[i] = obs_audio_encoder_create(enc_id, name.array, audio_settings, i, NULL);
 			}
 			dstr_free(&name);
@@ -878,7 +878,7 @@ static void update_encoder(struct source_record_filter_context *filter, obs_data
 			for (int i = 0; i < MAX_AUDIO_MIXES; i++) {
 				if ((audio_track_mask & (1u << i)) == 0)
 					continue;
-				dstr_printf(&name, "%s track %d", obs_source_get_name(filter->source), i + 1);
+				dstr_printf(&name, "%s %d", obs_module_text("Track"), i + 1);
 				filter->audioEncoder[out_idx] = obs_audio_encoder_create(enc_id, name.array, audio_settings, i, NULL);
 				out_idx++;
 			}
