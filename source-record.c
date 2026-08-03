@@ -327,6 +327,15 @@ static void source_record_replay_saved(void *data, calldata_t *cd)
 	if (!context || !context->source)
 		return;
 
+	/* "saved" only ever fires on a genuine success (a failed/interrupted
+	 * flush instead fires "stop" with a non-success code, handled below in
+	 * source_record_replay_stopped) -- but that stop handler is the only
+	 * place replay_error gets set, and nothing previously cleared it back
+	 * to false afterward, so a single failed save (e.g. writing to a RAM
+	 * disk that briefly wasn't mounted) left the row stuck red/"Error"
+	 * indefinitely, even once saves started succeeding again. */
+	context->replay_error = false;
+
 	const char *path = calldata_string(cd, "path");
 	char *path_fallback = NULL;
 	if ((!path || !strlen(path)) && context->replayOutput) {
