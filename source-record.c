@@ -63,6 +63,10 @@ struct source_record_filter_context {
 	bool remove_after_record;
 	long long record_max_seconds;
 	int last_frontend_event;
+	bool source_hidden_in_scene;      // last known hidden state, to detect transitions
+	bool record_mode_hidden_override; // true if we forced record_mode to None because of hiding
+	long long saved_record_mode;      // record_mode to restore once un-hidden
+	float visibility_check_accum;     // throttle: only check every ~0.5s, not every tick
 };
 
 DARRAY(obs_source_t *) source_record_filters;
@@ -1609,9 +1613,67 @@ static void source_record_chapter_hotkey(void *data, obs_hotkey_id id, obs_hotke
 	calldata_free(&cd);
 }
 
+// True if `parent` isn't visible (or isn't present at all) in the currently
+// active/program scene. Not being in that scene at all counts as hidden too.
+static bool source_hidden_in_current_scene(obs_source_t *parent)
+{
+	obs_source_t *current_scene_source = obs_frontend_get_current_scene();
+	if (!current_scene_source)
+		return false; // no info available; don't force a change either way
+
+	bool hidden = true;
+	obs_scene_t *scene = obs_scene_from_source(current_scene_source);
+	if (scene) {
+		const char *name = obs_source_get_name(parent);
+		obs_sceneitem_t *item = name ? obs_scene_find_source_recursive(scene, name) : NULL;
+		if (item)
+			hidden = !obs_sceneitem_visible(item);
+	}
+	obs_source_release(current_scene_source);
+	return hidden;
+}
+
+// Forces record_mode to None while the source is hidden in the current
+// scene, and restores whatever it was set to beforehand once it's shown
+// again (staying None if that's what it already was).
+static void update_hidden_record_mode(struct source_record_filter_context *context, obs_source_t *parent, float seconds)
+{
+	context->visibility_check_accum += seconds;
+	if (context->visibility_check_accum < 0.5f)
+		return;
+	context->visibility_check_accum = 0.0f;
+
+	const bool hidden = source_hidden_in_current_scene(parent);
+	if (hidden == context->source_hidden_in_scene)
+		return;
+	context->source_hidden_in_scene = hidden;
+
+	obs_data_t *current_settings = obs_source_get_settings(context->source);
+	const long long current_mode = obs_data_get_int(current_settings, "record_mode");
+
+	if (hidden) {
+		context->saved_record_mode = current_mode;
+		context->record_mode_hidden_override = true;
+		if (current_mode != OUTPUT_MODE_NONE) {
+			obs_data_t *update = obs_data_create();
+			obs_data_set_int(update, "record_mode", OUTPUT_MODE_NONE);
+			obs_source_update(context->source, update);
+			obs_data_release(update);
+		}
+	} else if (context->record_mode_hidden_override) {
+		context->record_mode_hidden_override = false;
+		if (current_mode != context->saved_record_mode) {
+			obs_data_t *update = obs_data_create();
+			obs_data_set_int(update, "record_mode", context->saved_record_mode);
+			obs_source_update(context->source, update);
+			obs_data_release(update);
+		}
+	}
+	obs_data_release(current_settings);
+}
+
 static void source_record_filter_tick(void *data, float seconds)
 {
-	UNUSED_PARAMETER(seconds);
 	struct source_record_filter_context *context = data;
 	if (context->closing)
 		return;
@@ -1624,6 +1686,8 @@ static void source_record_filter_tick(void *data, float seconds)
 		context->closing = true;
 		return;
 	}
+
+	update_hidden_record_mode(context, parent, seconds);
 
 	if (context->enableHotkey == OBS_INVALID_HOTKEY_PAIR_ID)
 		context->enableHotkey = obs_hotkey_pair_register_source(
