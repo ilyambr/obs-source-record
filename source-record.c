@@ -63,6 +63,10 @@ struct source_record_filter_context {
 	bool remove_after_record;
 	long long record_max_seconds;
 	int last_frontend_event;
+	bool source_hidden_in_scene;      // last known hidden state, to detect transitions
+	bool record_mode_hidden_override; // true if we forced record_mode to None because of hiding
+	long long saved_record_mode;      // record_mode to restore once un-hidden
+	float visibility_check_accum;     // throttle: only check every ~0.5s, not every tick
 };
 
 DARRAY(obs_source_t *) source_record_filters;
@@ -327,6 +331,15 @@ static void source_record_replay_saved(void *data, calldata_t *cd)
 	if (!context || !context->source)
 		return;
 
+	/* "saved" only ever fires on a genuine success (a failed/interrupted
+	 * flush instead fires "stop" with a non-success code, handled below in
+	 * source_record_replay_stopped) -- but that stop handler is the only
+	 * place replay_error gets set, and nothing previously cleared it back
+	 * to false afterward, so a single failed save (e.g. writing to a RAM
+	 * disk that briefly wasn't mounted) left the row stuck red/"Error"
+	 * indefinitely, even once saves started succeeding again. */
+	context->replay_error = false;
+
 	const char *path = calldata_string(cd, "path");
 	char *path_fallback = NULL;
 	if ((!path || !strlen(path)) && context->replayOutput) {
@@ -361,6 +374,17 @@ static void source_record_replay_saved(void *data, calldata_t *cd)
 
 	obs_websocket_vendor_emit_event(vendor, "replay_buffer_saved", event_data);
 	obs_data_release(event_data);
+
+	/* Plain (non-websocket-dependent) signal for other plugins to hook. */
+	signal_handler_t *filter_sh = obs_source_get_signal_handler(context->source);
+	if (filter_sh) {
+		calldata_t signal_cd;
+		calldata_init(&signal_cd);
+		calldata_set_string(&signal_cd, "path", emit_path);
+		signal_handler_signal(filter_sh, "replay_saved", &signal_cd);
+		calldata_free(&signal_cd);
+	}
+
 	bfree(path_fallback);
 }
 
@@ -442,6 +466,22 @@ static void get_replay_buffer_status_proc(void *data, calldata_t *cd)
 	get_output_hotkey_str(context->replayOutput, &hotkey_str);
 	calldata_set_string(cd, "hotkey", hotkey_str.array ? hotkey_str.array : "");
 	dstr_free(&hotkey_str);
+}
+
+static void save_replay_buffer_proc(void *data, calldata_t *cd)
+{
+	struct source_record_filter_context *context = data;
+	bool success = false;
+	if (context->replayOutput) {
+		proc_handler_t *ph = obs_output_get_proc_handler(context->replayOutput);
+		if (ph) {
+			calldata_t inner_cd;
+			calldata_init(&inner_cd);
+			success = proc_handler_call(ph, "save", &inner_cd);
+			calldata_free(&inner_cd);
+		}
+	}
+	calldata_set_bool(cd, "success", success);
 }
 
 void release_output_stopped(void *data, calldata_t *cd)
@@ -954,7 +994,7 @@ static void update_encoder(struct source_record_filter_context *filter, obs_data
 			struct dstr name;
 			dstr_init(&name);
 			for (int i = 0; i < MAX_AUDIO_MIXES; i++) {
-				dstr_printf(&name, "%s track %d", obs_source_get_name(filter->source), i + 1);
+				dstr_printf(&name, "%s %d", obs_module_text("Track"), i + 1);
 				filter->audioEncoder[i] = obs_audio_encoder_create(enc_id, name.array, audio_settings, i, NULL);
 			}
 			dstr_free(&name);
@@ -965,7 +1005,7 @@ static void update_encoder(struct source_record_filter_context *filter, obs_data
 			for (int i = 0; i < MAX_AUDIO_MIXES; i++) {
 				if ((audio_track_mask & (1u << i)) == 0)
 					continue;
-				dstr_printf(&name, "%s track %d", obs_source_get_name(filter->source), i + 1);
+				dstr_printf(&name, "%s %d", obs_module_text("Track"), i + 1);
 				filter->audioEncoder[out_idx] = obs_audio_encoder_create(enc_id, name.array, audio_settings, i, NULL);
 				out_idx++;
 			}
@@ -1395,9 +1435,15 @@ static void *source_record_filter_create(obs_data_t *settings, obs_source_t *sou
 	context->chapterHotkey = OBS_INVALID_HOTKEY_ID;
 
 	proc_handler_t *ph = obs_source_get_proc_handler(source);
-	if (ph)
+	if (ph) {
 		proc_handler_add(ph, "void get_replay_buffer_status(out bool enabled, out bool active, out bool error, out string hotkey)",
 				 get_replay_buffer_status_proc, context);
+		proc_handler_add(ph, "void save_replay_buffer(out bool success)", save_replay_buffer_proc, context);
+	}
+
+	signal_handler_t *filter_sh = obs_source_get_signal_handler(source);
+	if (filter_sh)
+		signal_handler_add(filter_sh, "void replay_saved(string path)");
 
 	source_record_filter_update(context, settings);
 	obs_frontend_add_event_callback(frontend_event, context);
@@ -1567,9 +1613,67 @@ static void source_record_chapter_hotkey(void *data, obs_hotkey_id id, obs_hotke
 	calldata_free(&cd);
 }
 
+// True if `parent` isn't visible (or isn't present at all) in the currently
+// active/program scene. Not being in that scene at all counts as hidden too.
+static bool source_hidden_in_current_scene(obs_source_t *parent)
+{
+	obs_source_t *current_scene_source = obs_frontend_get_current_scene();
+	if (!current_scene_source)
+		return false; // no info available; don't force a change either way
+
+	bool hidden = true;
+	obs_scene_t *scene = obs_scene_from_source(current_scene_source);
+	if (scene) {
+		const char *name = obs_source_get_name(parent);
+		obs_sceneitem_t *item = name ? obs_scene_find_source_recursive(scene, name) : NULL;
+		if (item)
+			hidden = !obs_sceneitem_visible(item);
+	}
+	obs_source_release(current_scene_source);
+	return hidden;
+}
+
+// Forces record_mode to None while the source is hidden in the current
+// scene, and restores whatever it was set to beforehand once it's shown
+// again (staying None if that's what it already was).
+static void update_hidden_record_mode(struct source_record_filter_context *context, obs_source_t *parent, float seconds)
+{
+	context->visibility_check_accum += seconds;
+	if (context->visibility_check_accum < 0.5f)
+		return;
+	context->visibility_check_accum = 0.0f;
+
+	const bool hidden = source_hidden_in_current_scene(parent);
+	if (hidden == context->source_hidden_in_scene)
+		return;
+	context->source_hidden_in_scene = hidden;
+
+	obs_data_t *current_settings = obs_source_get_settings(context->source);
+	const long long current_mode = obs_data_get_int(current_settings, "record_mode");
+
+	if (hidden) {
+		context->saved_record_mode = current_mode;
+		context->record_mode_hidden_override = true;
+		if (current_mode != OUTPUT_MODE_NONE) {
+			obs_data_t *update = obs_data_create();
+			obs_data_set_int(update, "record_mode", OUTPUT_MODE_NONE);
+			obs_source_update(context->source, update);
+			obs_data_release(update);
+		}
+	} else if (context->record_mode_hidden_override) {
+		context->record_mode_hidden_override = false;
+		if (current_mode != context->saved_record_mode) {
+			obs_data_t *update = obs_data_create();
+			obs_data_set_int(update, "record_mode", context->saved_record_mode);
+			obs_source_update(context->source, update);
+			obs_data_release(update);
+		}
+	}
+	obs_data_release(current_settings);
+}
+
 static void source_record_filter_tick(void *data, float seconds)
 {
-	UNUSED_PARAMETER(seconds);
 	struct source_record_filter_context *context = data;
 	if (context->closing)
 		return;
@@ -1582,6 +1686,8 @@ static void source_record_filter_tick(void *data, float seconds)
 		context->closing = true;
 		return;
 	}
+
+	update_hidden_record_mode(context, parent, seconds);
 
 	if (context->enableHotkey == OBS_INVALID_HOTKEY_PAIR_ID)
 		context->enableHotkey = obs_hotkey_pair_register_source(
