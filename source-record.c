@@ -82,6 +82,22 @@ static void run_queued(obs_task_t task, void *param)
 	}
 }
 
+/* obs_output_release() (-> obs_output_destroy()) is what actually frees an
+ * output's buffered memory. For a replay_buffer output that can mean walking
+ * and freeing up to max_size_mb (we hardcode 10000, i.e. ~10GB) of buffered
+ * packets -- dispatching that through run_queued() above put it on
+ * OBS_TASK_GRAPHICS/OBS_TASK_UI, both threads the rest of OBS's rendering and
+ * UI depend on staying responsive, so freeing a large buffer there froze the
+ * entire OBS window for as long as the free took (reported: ~30s, with memory
+ * visibly draining during the freeze). libobs has a dedicated OBS_TASK_DESTROY
+ * background thread (obs->destruction_task_thread) for exactly this kind of
+ * expensive teardown work -- upstream's own mp4-output.c offloads its muxer
+ * destruction the same way -- so route the actual release there instead. */
+static void run_destroy_queued(obs_task_t task, void *param)
+{
+	obs_queue_task(OBS_TASK_DESTROY, task, param, false);
+}
+
 static const char *source_record_filter_get_name(void *unused)
 {
 	UNUSED_PARAMETER(unused);
@@ -489,7 +505,7 @@ void release_output_stopped(void *data, calldata_t *cd)
 	UNUSED_PARAMETER(cd);
 	struct stop_output *so = data;
 	if (!so->context->exiting)
-		run_queued((obs_task_t)obs_output_release, so->output);
+		run_destroy_queued((obs_task_t)obs_output_release, so->output);
 	if (so->context->encoder || so->context->audioEncoder[0]) {
 		if (so->context->exiting || so->context->closing)
 			release_encoders(so->context);
@@ -525,7 +541,11 @@ static void force_stop_output_task(void *data)
 	}
 	obs_output_force_stop(so->output);
 	if (!sh) {
-		obs_output_release(so->output);
+		/* No "stop" signal to wait on, so free right away -- but still
+		 * off OBS_TASK_GRAPHICS/OBS_TASK_UI (this function is already
+		 * running on one of those two), for the same reason as the
+		 * signal-driven path in release_output_stopped() above. */
+		run_destroy_queued((obs_task_t)obs_output_release, so->output);
 		release_encoders(so->context);
 		bfree(data);
 	}
