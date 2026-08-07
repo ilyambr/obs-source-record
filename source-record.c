@@ -502,6 +502,23 @@ void release_output_stopped(void *data, calldata_t *cd)
 static void force_stop_output_task(void *data)
 {
 	struct stop_output *so = data;
+
+	/* If this output was torn down before it ever actually started (still
+	 * mid start_replay_task/equivalent, queued via run_queued() but not yet
+	 * run -- a duration change or a resize-triggered restart can both race
+	 * ahead of it), obs_output_force_stop() below never fires the "stop"
+	 * signal: that signal only fires on an active -> inactive transition,
+	 * and this output was never active. release_output_stopped (the only
+	 * place that actually frees the output/encoder/any buffered frames it
+	 * already holds) is connected to exactly that signal, so it would just
+	 * never run, leaking all of it for the rest of the process's lifetime.
+	 * Skip the signal round-trip entirely and free synchronously right here
+	 * instead -- there's nothing running to force-stop in the first place. */
+	if (!obs_output_active(so->output)) {
+		release_output_stopped(data, NULL);
+		return;
+	}
+
 	signal_handler_t *sh = obs_output_get_signal_handler(so->output);
 	if (sh) {
 		signal_handler_connect(sh, "stop", release_output_stopped, data);
