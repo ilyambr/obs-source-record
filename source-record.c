@@ -470,6 +470,20 @@ static void get_output_hotkey_str(obs_output_t *output, struct dstr *str)
 		obs_key_combination_to_str(bind_ctx.combo, str);
 }
 
+/* Mirrors get_replay_buffer_status_proc below, but for the filter's own file
+ * recording -- there's no equivalent "error" flag tracked for record the way
+ * replay_error is, and no dedicated per-filter record hotkey (only pause/split),
+ * so this just reports whether record_mode currently resolves to on and
+ * whether the file output is actually running. Lets external docks (e.g.
+ * obs-replay-slider's control panel) show live status without duplicating
+ * this filter's own record_mode bookkeeping. */
+static void get_record_status_proc(void *data, calldata_t *cd)
+{
+	struct source_record_filter_context *context = data;
+	calldata_set_bool(cd, "enabled", context->record);
+	calldata_set_bool(cd, "active", context->fileOutput && obs_output_active(context->fileOutput));
+}
+
 static void get_replay_buffer_status_proc(void *data, calldata_t *cd)
 {
 	struct source_record_filter_context *context = data;
@@ -1476,6 +1490,7 @@ static void *source_record_filter_create(obs_data_t *settings, obs_source_t *sou
 		proc_handler_add(ph, "void get_replay_buffer_status(out bool enabled, out bool active, out bool error, out string hotkey)",
 				 get_replay_buffer_status_proc, context);
 		proc_handler_add(ph, "void save_replay_buffer(out bool success)", save_replay_buffer_proc, context);
+		proc_handler_add(ph, "void get_record_status(out bool enabled, out bool active)", get_record_status_proc, context);
 	}
 
 	signal_handler_t *filter_sh = obs_source_get_signal_handler(source);
