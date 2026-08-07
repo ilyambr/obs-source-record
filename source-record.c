@@ -54,6 +54,16 @@ struct source_record_filter_context {
 	obs_hotkey_id chapterHotkey;
 	int audio_track;
 	uint32_t audio_track_mask;
+	/* audio_source itself (the pointer stored in the field below) is written
+	 * from source_record_filter_update, which can run on the UI thread or
+	 * (via the websocket vendor API) an arbitrary caller thread, while
+	 * audio_input_callback reads/dereferences it concurrently on OBS's audio
+	 * mixer thread -- with no lock, changing the "Different Audio Source"
+	 * setting while an output is active could free the weak-source wrapper
+	 * on one thread at the same instant the audio thread is mid-call into
+	 * obs_weak_source_get_source() on it. audio_source_mutex guards every
+	 * read and write of this field. */
+	pthread_mutex_t audio_source_mutex;
 	obs_weak_source_t *audio_source;
 	bool closing;
 	bool exiting;
@@ -175,11 +185,18 @@ static bool audio_input_callback(void *param, uint64_t start_ts_in, uint64_t end
 
 	obs_source_t *audio_source = NULL;
 	bool release_audio = false;
-	if (filter->audio_source) {
+	/* Locked so filter->audio_source can't be released/replaced by
+	 * source_record_filter_update on another thread between checking it's
+	 * non-NULL and actually resolving it -- see the field's own comment. */
+	pthread_mutex_lock(&filter->audio_source_mutex);
+	bool had_weak_ref = filter->audio_source != NULL;
+	if (had_weak_ref) {
 		audio_source = obs_weak_source_get_source(filter->audio_source);
 		if (audio_source)
 			release_audio = true;
-	} else {
+	}
+	pthread_mutex_unlock(&filter->audio_source_mutex);
+	if (!had_weak_ref) {
 		audio_source = obs_filter_get_parent(filter->source);
 	}
 	if (!audio_source || obs_source_removed(audio_source)) {
@@ -598,18 +615,32 @@ static void ensure_directory(char *path)
 #endif
 }
 
-static void remove_filter(void *data, calldata_t *calldata)
+static void remove_filter_task(void *data)
 {
-	UNUSED_PARAMETER(calldata);
 	struct source_record_filter_context *filter = data;
-	signal_handler_t *sh = obs_output_get_signal_handler(filter->fileOutput);
-	signal_handler_disconnect(sh, "stop", remove_filter, filter);
 	obs_source_t *source = obs_filter_get_parent(filter->source);
 	if (!source && filter->view) {
 		source = obs_view_get_source(filter->view, SOURCE_CHANNEL);
 		obs_source_release(source);
 	}
 	obs_source_filter_remove(source, filter->source);
+}
+
+static void remove_filter(void *data, calldata_t *calldata)
+{
+	UNUSED_PARAMETER(calldata);
+	struct source_record_filter_context *filter = data;
+	signal_handler_t *sh = obs_output_get_signal_handler(filter->fileOutput);
+	signal_handler_disconnect(sh, "stop", remove_filter, filter);
+	/* obs_source_filter_remove() below synchronously destroys the filter
+	 * (source_record_filter_destroy frees `filter`) when nothing else holds
+	 * an extra ref -- but this callback is connected to the SAME "stop"
+	 * signal as release_output_stopped (connected later, at teardown time),
+	 * and libobs dispatches signal callbacks in registration order, so
+	 * release_output_stopped runs right after this one and would dereference
+	 * the `filter` this just freed. Deferring the actual removal to a queued
+	 * task lets this "stop" signal's other callbacks finish safely first. */
+	run_queued(remove_filter_task, filter);
 }
 
 static void stop_output_sync(struct source_record_filter_context *context, obs_output_t *output)
@@ -1354,6 +1385,11 @@ static void source_record_filter_update(void *data, obs_data_t *settings)
 
 	vec4_from_rgba(&filter->backgroundColor, (uint32_t)obs_data_get_int(settings, "backgroundColor"));
 
+	/* Locked for the same reason as audio_input_callback's read -- this can
+	 * run on the UI thread or, via the websocket vendor API, an arbitrary
+	 * caller thread, concurrently with the audio mixer thread resolving
+	 * filter->audio_source. See the field's own comment. */
+	pthread_mutex_lock(&filter->audio_source_mutex);
 	if (obs_data_get_bool(settings, "different_audio")) {
 		const char *source_name = obs_data_get_string(settings, "audio_source");
 		if (!strlen(source_name)) {
@@ -1382,6 +1418,7 @@ static void source_record_filter_update(void *data, obs_data_t *settings)
 		obs_weak_source_release(filter->audio_source);
 		filter->audio_source = NULL;
 	}
+	pthread_mutex_unlock(&filter->audio_source_mutex);
 }
 
 static void source_record_filter_save(void *data, obs_data_t *settings)
@@ -1477,6 +1514,7 @@ static void *source_record_filter_create(obs_data_t *settings, obs_source_t *sou
 {
 	struct source_record_filter_context *context = bzalloc(sizeof(struct source_record_filter_context));
 	context->source = source;
+	pthread_mutex_init(&context->audio_source_mutex, NULL);
 
 	da_push_back(source_record_filters, &source);
 	context->last_frontend_event = -1;
@@ -1531,9 +1569,20 @@ static void source_record_filter_destroy(void *data)
 	if (context->chapterHotkey != OBS_INVALID_HOTKEY_ID)
 		obs_hotkey_unregister(context->chapterHotkey);
 
-	obs_output_release(context->fileOutput);
-	obs_output_release(context->streamOutput);
-	obs_output_release(context->replayOutput);
+	/* Same reasoning as release_output_stopped's obs_output_release call
+	 * (see run_destroy_queued's comment near the top of this file) -- this
+	 * function runs synchronously on whatever thread destroys the filter
+	 * (removing it from the Filters panel, or OBS closing with the source
+	 * still present, both typically the UI thread), and a replayOutput can
+	 * hold up to ~10GB of buffered packets. Releasing it inline here
+	 * reintroduced the exact multi-second freeze the OBS_TASK_DESTROY fix
+	 * elsewhere in this file was meant to eliminate -- this call path was
+	 * simply missed the first time. These only need the raw obs_output_t
+	 * handles, not `context` (which gets freed below), so deferring them is
+	 * safe even though `context` won't outlive this function. */
+	run_destroy_queued((obs_task_t)obs_output_release, context->fileOutput);
+	run_destroy_queued((obs_task_t)obs_output_release, context->streamOutput);
+	run_destroy_queued((obs_task_t)obs_output_release, context->replayOutput);
 	context->fileOutput = NULL;
 	context->streamOutput = NULL;
 	context->replayOutput = NULL;
@@ -1545,8 +1594,11 @@ static void source_record_filter_destroy(void *data)
 	obs_encoder_release(context->encoder);
 	context->encoder = NULL;
 
+	pthread_mutex_lock(&context->audio_source_mutex);
 	obs_weak_source_release(context->audio_source);
 	context->audio_source = NULL;
+	pthread_mutex_unlock(&context->audio_source_mutex);
+	pthread_mutex_destroy(&context->audio_source_mutex);
 
 	if (context->audio_track == 0 && context->audio_output)
 		audio_output_close(context->audio_output);
