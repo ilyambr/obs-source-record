@@ -82,6 +82,22 @@ static void run_queued(obs_task_t task, void *param)
 	}
 }
 
+/* obs_output_release() (-> obs_output_destroy()) is what actually frees an
+ * output's buffered memory. For a replay_buffer output that can mean walking
+ * and freeing up to max_size_mb (we hardcode 10000, i.e. ~10GB) of buffered
+ * packets -- dispatching that through run_queued() above put it on
+ * OBS_TASK_GRAPHICS/OBS_TASK_UI, both threads the rest of OBS's rendering and
+ * UI depend on staying responsive, so freeing a large buffer there froze the
+ * entire OBS window for as long as the free took (reported: ~30s, with memory
+ * visibly draining during the freeze). libobs has a dedicated OBS_TASK_DESTROY
+ * background thread (obs->destruction_task_thread) for exactly this kind of
+ * expensive teardown work -- upstream's own mp4-output.c offloads its muxer
+ * destruction the same way -- so route the actual release there instead. */
+static void run_destroy_queued(obs_task_t task, void *param)
+{
+	obs_queue_task(OBS_TASK_DESTROY, task, param, false);
+}
+
 static const char *source_record_filter_get_name(void *unused)
 {
 	UNUSED_PARAMETER(unused);
@@ -454,6 +470,20 @@ static void get_output_hotkey_str(obs_output_t *output, struct dstr *str)
 		obs_key_combination_to_str(bind_ctx.combo, str);
 }
 
+/* Mirrors get_replay_buffer_status_proc below, but for the filter's own file
+ * recording -- there's no equivalent "error" flag tracked for record the way
+ * replay_error is, and no dedicated per-filter record hotkey (only pause/split),
+ * so this just reports whether record_mode currently resolves to on and
+ * whether the file output is actually running. Lets external docks (e.g.
+ * obs-replay-slider's control panel) show live status without duplicating
+ * this filter's own record_mode bookkeeping. */
+static void get_record_status_proc(void *data, calldata_t *cd)
+{
+	struct source_record_filter_context *context = data;
+	calldata_set_bool(cd, "enabled", context->record);
+	calldata_set_bool(cd, "active", context->fileOutput && obs_output_active(context->fileOutput));
+}
+
 static void get_replay_buffer_status_proc(void *data, calldata_t *cd)
 {
 	struct source_record_filter_context *context = data;
@@ -489,7 +519,7 @@ void release_output_stopped(void *data, calldata_t *cd)
 	UNUSED_PARAMETER(cd);
 	struct stop_output *so = data;
 	if (!so->context->exiting)
-		run_queued((obs_task_t)obs_output_release, so->output);
+		run_destroy_queued((obs_task_t)obs_output_release, so->output);
 	if (so->context->encoder || so->context->audioEncoder[0]) {
 		if (so->context->exiting || so->context->closing)
 			release_encoders(so->context);
@@ -525,7 +555,11 @@ static void force_stop_output_task(void *data)
 	}
 	obs_output_force_stop(so->output);
 	if (!sh) {
-		obs_output_release(so->output);
+		/* No "stop" signal to wait on, so free right away -- but still
+		 * off OBS_TASK_GRAPHICS/OBS_TASK_UI (this function is already
+		 * running on one of those two), for the same reason as the
+		 * signal-driven path in release_output_stopped() above. */
+		run_destroy_queued((obs_task_t)obs_output_release, so->output);
 		release_encoders(so->context);
 		bfree(data);
 	}
@@ -1456,6 +1490,7 @@ static void *source_record_filter_create(obs_data_t *settings, obs_source_t *sou
 		proc_handler_add(ph, "void get_replay_buffer_status(out bool enabled, out bool active, out bool error, out string hotkey)",
 				 get_replay_buffer_status_proc, context);
 		proc_handler_add(ph, "void save_replay_buffer(out bool success)", save_replay_buffer_proc, context);
+		proc_handler_add(ph, "void get_record_status(out bool enabled, out bool active)", get_record_status_proc, context);
 	}
 
 	signal_handler_t *filter_sh = obs_source_get_signal_handler(source);
