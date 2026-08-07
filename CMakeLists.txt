@@ -6,7 +6,15 @@ else()
   cmake_minimum_required(VERSION 3.18)
 endif()
 
-project(source-record VERSION 0.4.13)
+# This literal -- not buildspec.json's "version" field -- is what actually
+# gets embedded into the compiled binary (see version.h.in/resource.rc.in,
+# and source-record.c's own startup log line). buildspec.json's version was
+# bumped through 0.4.14/0.4.15/0.4.16 across several releases without this
+# ever being touched, so every DLL built since 0.4.13 silently kept
+# self-reporting "0.4.13" regardless of what was actually in it -- caught via
+# Backtrack's auto-updater looking "stuck" when it wasn't. Keep this in sync
+# with buildspec.json's version on every release.
+project(source-record VERSION 0.4.16)
 set(PROJECT_FULL_NAME "Source Record")
 
 # Set new UUIDs when you start to create a new plugin.
