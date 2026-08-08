@@ -70,6 +70,12 @@ struct source_record_filter_context {
 	long long replay_buffer_duration;
 	bool replay_error;
 	bool record_error;
+	/* The exact resolved file path (timestamp placeholders already expanded)
+	 * the most recent start_file_output() computed and handed to the output
+	 * as its own "path" setting -- kept around so get_record_status can
+	 * report it, same idea as ffmpeg-mux's own get_last_replay proc handler,
+	 * which only exists for the replay-buffer output variant, not this one. */
+	struct dstr last_output_path;
 	struct vec4 backgroundColor;
 	bool remove_after_record;
 	long long record_max_seconds;
@@ -503,16 +509,20 @@ static void get_output_hotkey_str(obs_output_t *output, struct dstr *str)
 /* Mirrors get_replay_buffer_status_proc below, but for the filter's own file
  * recording -- no dedicated per-filter record hotkey (only pause/split), so
  * this just reports whether record_mode currently resolves to on, whether
- * the file output is actually running, and (now, mirroring replay_error)
- * whether the last stop was a failure rather than a normal one. Lets
- * external docks (e.g. obs-replay-slider's control panel) show live status
- * without duplicating this filter's own record_mode bookkeeping. */
+ * the file output is actually running, whether the last stop was a failure
+ * rather than a normal one (mirrors replay_error), and the exact resolved
+ * path of the most recent (or current) recording -- same idea as ffmpeg-mux's
+ * own get_last_replay proc, which only exists for the replay-buffer output
+ * variant, not this one. Lets external docks (e.g. obs-replay-slider's
+ * control panel) show live status without duplicating this filter's own
+ * record_mode bookkeeping. */
 static void get_record_status_proc(void *data, calldata_t *cd)
 {
 	struct source_record_filter_context *context = data;
 	calldata_set_bool(cd, "enabled", context->record);
 	calldata_set_bool(cd, "active", context->fileOutput && obs_output_active(context->fileOutput));
 	calldata_set_bool(cd, "error", context->record_error);
+	calldata_set_string(cd, "path", context->last_output_path.array ? context->last_output_path.array : "");
 }
 
 static void get_replay_buffer_status_proc(void *data, calldata_t *cd)
@@ -751,6 +761,7 @@ static void start_file_output(struct source_record_filter_context *filter, obs_d
 	bfree(filename);
 	ensure_directory(path);
 	obs_data_set_string(s, "path", path);
+	dstr_copy(&filter->last_output_path, path);
 	obs_data_set_string(s, "directory", obs_data_get_string(settings, "path"));
 	obs_data_set_string(s, "format", obs_data_get_string(settings, "filename_formatting"));
 	obs_data_set_string(s, "extension", GetFormatExt(format));
@@ -1544,7 +1555,7 @@ static void *source_record_filter_create(obs_data_t *settings, obs_source_t *sou
 		proc_handler_add(ph, "void get_replay_buffer_status(out bool enabled, out bool active, out bool error, out string hotkey)",
 				 get_replay_buffer_status_proc, context);
 		proc_handler_add(ph, "void save_replay_buffer(out bool success)", save_replay_buffer_proc, context);
-		proc_handler_add(ph, "void get_record_status(out bool enabled, out bool active, out bool error)", get_record_status_proc, context);
+		proc_handler_add(ph, "void get_record_status(out bool enabled, out bool active, out bool error, out string path)", get_record_status_proc, context);
 	}
 
 	signal_handler_t *filter_sh = obs_source_get_signal_handler(source);
@@ -1615,6 +1626,8 @@ static void source_record_filter_destroy(void *data)
 	context->audio_source = NULL;
 	pthread_mutex_unlock(&context->audio_source_mutex);
 	pthread_mutex_destroy(&context->audio_source_mutex);
+
+	dstr_free(&context->last_output_path);
 
 	if (context->audio_track == 0 && context->audio_output)
 		audio_output_close(context->audio_output);
