@@ -14,7 +14,7 @@ endif()
 # self-reporting "0.4.13" regardless of what was actually in it -- caught via
 # Backtrack's auto-updater looking "stuck" when it wasn't. Keep this in sync
 # with buildspec.json's version on every release.
-project(source-record VERSION 0.4.16)
+project(source-record VERSION 0.4.17)
 set(PROJECT_FULL_NAME "Source Record")
 
 # Set new UUIDs when you start to create a new plugin.

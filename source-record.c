@@ -69,6 +69,7 @@ struct source_record_filter_context {
 	bool exiting;
 	long long replay_buffer_duration;
 	bool replay_error;
+	bool record_error;
 	struct vec4 backgroundColor;
 	bool remove_after_record;
 	long long record_max_seconds;
@@ -428,6 +429,18 @@ static void source_record_replay_stopped(void *data, calldata_t *cd)
 	context->replay_error = code != OBS_OUTPUT_SUCCESS;
 }
 
+/* Mirrors source_record_replay_stopped above -- fills in the "no equivalent
+ * error flag tracked for record" gap get_record_status_proc's own comment
+ * used to call out. Connected unconditionally (not just when
+ * remove_after_record is set) so a row's Error status is accurate regardless
+ * of that option. */
+static void source_record_file_stopped(void *data, calldata_t *cd)
+{
+	struct source_record_filter_context *context = data;
+	const long long code = calldata_int(cd, "code");
+	context->record_error = code != OBS_OUTPUT_SUCCESS;
+}
+
 struct find_output_hotkey_ctx {
 	/* obs_hotkey_register_output() stores the registerer as the output's weak
 	 * wrapper (obs_output_get_weak_output()), not the raw obs_output_t*, so
@@ -488,17 +501,18 @@ static void get_output_hotkey_str(obs_output_t *output, struct dstr *str)
 }
 
 /* Mirrors get_replay_buffer_status_proc below, but for the filter's own file
- * recording -- there's no equivalent "error" flag tracked for record the way
- * replay_error is, and no dedicated per-filter record hotkey (only pause/split),
- * so this just reports whether record_mode currently resolves to on and
- * whether the file output is actually running. Lets external docks (e.g.
- * obs-replay-slider's control panel) show live status without duplicating
- * this filter's own record_mode bookkeeping. */
+ * recording -- no dedicated per-filter record hotkey (only pause/split), so
+ * this just reports whether record_mode currently resolves to on, whether
+ * the file output is actually running, and (now, mirroring replay_error)
+ * whether the last stop was a failure rather than a normal one. Lets
+ * external docks (e.g. obs-replay-slider's control panel) show live status
+ * without duplicating this filter's own record_mode bookkeeping. */
 static void get_record_status_proc(void *data, calldata_t *cd)
 {
 	struct source_record_filter_context *context = data;
 	calldata_set_bool(cd, "enabled", context->record);
 	calldata_set_bool(cd, "active", context->fileOutput && obs_output_active(context->fileOutput));
+	calldata_set_bool(cd, "error", context->record_error);
 }
 
 static void get_replay_buffer_status_proc(void *data, calldata_t *cd)
@@ -753,8 +767,9 @@ static void start_file_output(struct source_record_filter_context *filter, obs_d
 	if (!filter->fileOutput || strcmp(obs_output_get_id(filter->fileOutput), output_id) != 0) {
 		obs_output_release(filter->fileOutput);
 		filter->fileOutput = obs_output_create(output_id, obs_source_get_name(filter->source), s, NULL);
+		signal_handler_t *sh = obs_output_get_signal_handler(filter->fileOutput);
+		signal_handler_connect(sh, "stop", source_record_file_stopped, filter);
 		if (filter->remove_after_record) {
-			signal_handler_t *sh = obs_output_get_signal_handler(filter->fileOutput);
 			signal_handler_connect(sh, "stop", remove_filter, filter);
 		}
 	} else {
@@ -774,6 +789,7 @@ static void start_file_output(struct source_record_filter_context *filter, obs_d
 	}
 
 	filter->starting_file_output = true;
+	filter->record_error = false;
 
 	run_queued(start_file_output_task, filter);
 }
@@ -1528,7 +1544,7 @@ static void *source_record_filter_create(obs_data_t *settings, obs_source_t *sou
 		proc_handler_add(ph, "void get_replay_buffer_status(out bool enabled, out bool active, out bool error, out string hotkey)",
 				 get_replay_buffer_status_proc, context);
 		proc_handler_add(ph, "void save_replay_buffer(out bool success)", save_replay_buffer_proc, context);
-		proc_handler_add(ph, "void get_record_status(out bool enabled, out bool active)", get_record_status_proc, context);
+		proc_handler_add(ph, "void get_record_status(out bool enabled, out bool active, out bool error)", get_record_status_proc, context);
 	}
 
 	signal_handler_t *filter_sh = obs_source_get_signal_handler(source);
