@@ -84,6 +84,20 @@ struct source_record_filter_context {
 	bool record_mode_hidden_override; // true if we forced record_mode to None because of hiding
 	long long saved_record_mode;      // record_mode to restore once un-hidden
 	float visibility_check_accum;     // throttle: only check every ~0.5s, not every tick
+
+	// Throttle for check_encoder_overload: only check every ~2s, not every
+	// tick. prev_total/prev_dropped per output are baselines so the rate
+	// reported is "since the last check", not a lifetime-cumulative fraction
+	// that would stay diluted-looking long after a transient problem
+	// cleared up. Tracked per-filter-instance even for the 3 main-program
+	// outputs (not shared/global) -- simpler than synchronizing a shared
+	// baseline across every filter instance's own tick callback, at the
+	// minor cost of each instance independently recomputing the same delta.
+	float encoder_overload_check_accum;
+	int own_prev_total, own_prev_dropped;
+	int main_rec_prev_total, main_rec_prev_dropped;
+	int main_stream_prev_total, main_stream_prev_dropped;
+	int main_replay_prev_total, main_replay_prev_dropped;
 };
 
 DARRAY(obs_source_t *) source_record_filters;
@@ -1479,23 +1493,26 @@ static void source_record_filter_defaults(obs_data_t *settings)
 
 	obs_data_set_default_int(settings, "backgroundColor", 0);
 
-	const char *enc_id;
-	if (adv_out) {
-		enc_id = config_get_string(config, "AdvOut", "RecEncoder");
-		if (strcmp(enc_id, "none") == 0 || strcmp(enc_id, "None") == 0)
-			enc_id = config_get_string(config, "AdvOut", "Encoder");
-		else if (strcmp(enc_id, "jim_nvenc") == 0 || strcmp(enc_id, "obs_nvenc_h264_tex") == 0)
-			enc_id = "nvenc";
-
-	} else {
+	// Deliberately NOT matched to the main recording/stream's own encoder
+	// choice anymore (this used to follow AdvOut's RecEncoder/Encoder or
+	// SimpleOutput's RecEncoder/StreamEncoder) -- if the main output already
+	// uses NVENC, which is common, every brand new Source Record filter
+	// silently defaulted to NVENC too, piling up concurrent hardware encoder
+	// sessions on a GPU with a real per-chip throughput ceiling (reported
+	// live: main stream + this filter alone was enough to peg an RTX 3080's
+	// single NVENC chip at 100%, dropping frames). Software encoding is a
+	// safer default for a *secondary* recording specifically -- most modern
+	// CPUs have real headroom for one background x264 encode, and NVENC
+	// should stay reserved for whatever actually needs to be real-time.
+	// Users who genuinely want NVENC for a filter can still pick it
+	// explicitly in its properties; this only changes what a brand new
+	// filter starts as. Lossless is the one exception kept as-is -- that's a
+	// hard requirement (a specific encoder), not a load-balancing choice.
+	const char *enc_id = "x264";
+	if (!adv_out) {
 		const char *quality = config_get_string(config, "SimpleOutput", "RecQuality");
-		if (strcmp(quality, "Stream") == 0 || strcmp(quality, "stream") == 0) {
-			enc_id = config_get_string(config, "SimpleOutput", "StreamEncoder");
-		} else if (strcmp(quality, "Lossless") == 0 || strcmp(quality, "lossless") == 0) {
+		if (strcmp(quality, "Lossless") == 0 || strcmp(quality, "lossless") == 0)
 			enc_id = "ffmpeg_output";
-		} else {
-			enc_id = config_get_string(config, "SimpleOutput", "RecEncoder");
-		}
 	}
 	obs_data_set_default_string(settings, "encoder", enc_id);
 
@@ -1805,6 +1822,100 @@ static void update_hidden_record_mode(struct source_record_filter_context *conte
 	obs_data_release(current_settings);
 }
 
+// Percentage of frames dropped since the last check (not lifetime-cumulative
+// -- see the struct fields' own comment), or -1 if this output isn't
+// currently active, or if there isn't yet a full interval of new data to
+// compute a rate from (first check after it started, or momentarily paused).
+static float dropped_rate_since_last_check(obs_output_t *output, int *prev_total, int *prev_dropped)
+{
+	if (!output || !obs_output_active(output)) {
+		*prev_total = 0;
+		*prev_dropped = 0;
+		return -1.0f;
+	}
+	int total = obs_output_get_total_frames(output);
+	int dropped = obs_output_get_frames_dropped(output);
+	int delta_total = total - *prev_total;
+	int delta_dropped = dropped - *prev_dropped;
+	*prev_total = total;
+	*prev_dropped = dropped;
+	if (delta_total <= 0)
+		return -1.0f;
+	return 100.0f * (float)delta_dropped / (float)delta_total;
+}
+
+// A couple percent of dropped frames is common/harmless jitter, not a real
+// problem worth interrupting the user about.
+#define ENCODER_OVERLOAD_THRESHOLD 5.0f
+
+// Checks this filter's own active output AND the 3 main-program outputs
+// (recording/streaming/replay buffer, via obs-frontend-api) for a real
+// recent drop rate, and -- only if at least one crosses the threshold --
+// emits a websocket vendor event naming specifically which one(s), so an
+// external tool (Backtrack) can tell a user "it's the main stream" instead
+// of just "something's overloaded". Shared hardware (e.g. one NVENC chip)
+// means this filter's own output is never the only possible cause, and
+// checking only it would be misleading in either direction.
+static void check_encoder_overload(struct source_record_filter_context *context, float seconds)
+{
+	context->encoder_overload_check_accum += seconds;
+	if (context->encoder_overload_check_accum < 2.0f)
+		return;
+	context->encoder_overload_check_accum = 0.0f;
+
+	if (!vendor)
+		return; // obs-websocket isn't installed/loaded -- nothing to emit to
+
+	obs_output_t *own_output = context->fileOutput && obs_output_active(context->fileOutput)     ? context->fileOutput
+				    : context->replayOutput && obs_output_active(context->replayOutput) ? context->replayOutput
+				    : context->streamOutput && obs_output_active(context->streamOutput) ? context->streamOutput
+											      : NULL;
+	float own_rate = dropped_rate_since_last_check(own_output, &context->own_prev_total, &context->own_prev_dropped);
+
+	obs_output_t *main_rec = obs_frontend_get_recording_output();
+	float rec_rate = dropped_rate_since_last_check(main_rec, &context->main_rec_prev_total, &context->main_rec_prev_dropped);
+	if (main_rec)
+		obs_output_release(main_rec);
+
+	obs_output_t *main_stream = obs_frontend_get_streaming_output();
+	float stream_rate =
+		dropped_rate_since_last_check(main_stream, &context->main_stream_prev_total, &context->main_stream_prev_dropped);
+	if (main_stream)
+		obs_output_release(main_stream);
+
+	obs_output_t *main_replay = obs_frontend_get_replay_buffer_output();
+	float replay_rate =
+		dropped_rate_since_last_check(main_replay, &context->main_replay_prev_total, &context->main_replay_prev_dropped);
+	if (main_replay)
+		obs_output_release(main_replay);
+
+	bool own_bad = own_rate >= ENCODER_OVERLOAD_THRESHOLD;
+	bool rec_bad = rec_rate >= ENCODER_OVERLOAD_THRESHOLD;
+	bool stream_bad = stream_rate >= ENCODER_OVERLOAD_THRESHOLD;
+	bool replay_bad = replay_rate >= ENCODER_OVERLOAD_THRESHOLD;
+
+	if (!own_bad && !rec_bad && !stream_bad && !replay_bad)
+		return;
+
+	obs_data_t *event_data = obs_data_create();
+	obs_data_set_bool(event_data, "this_filter", own_bad);
+	obs_data_set_bool(event_data, "main_recording", rec_bad);
+	// Unlike recording/replay buffer (file outputs -- a drop there really is
+	// encoder/disk-side lag), a streaming output's dropped frames can also
+	// be network/bandwidth congestion, nothing to do with the encoder at
+	// all. Reported as its own flag either way; the caller decides how to
+	// word that distinction rather than this plugin asserting a cause it
+	// can't actually distinguish.
+	obs_data_set_bool(event_data, "main_stream", stream_bad);
+	obs_data_set_bool(event_data, "main_replay_buffer", replay_bad);
+	obs_source_t *parent = obs_filter_get_parent(context->source);
+	if (parent)
+		obs_data_set_string(event_data, "source", obs_source_get_name(parent));
+	obs_data_set_string(event_data, "filter", obs_source_get_name(context->source));
+	obs_websocket_vendor_emit_event(vendor, "encoder_overload", event_data);
+	obs_data_release(event_data);
+}
+
 static void source_record_filter_tick(void *data, float seconds)
 {
 	struct source_record_filter_context *context = data;
@@ -1821,6 +1932,7 @@ static void source_record_filter_tick(void *data, float seconds)
 	}
 
 	update_hidden_record_mode(context, parent, seconds);
+	check_encoder_overload(context, seconds);
 
 	if (context->enableHotkey == OBS_INVALID_HOTKEY_PAIR_ID)
 		context->enableHotkey = obs_hotkey_pair_register_source(
