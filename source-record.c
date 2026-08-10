@@ -1024,6 +1024,13 @@ static void update_encoder(struct source_record_filter_context *filter, obs_data
 		filter->encoder = NULL;
 		set_encoder_defaults(settings);
 		filter->encoder = obs_video_encoder_create(enc_id, obs_source_get_name(filter->source), settings, NULL);
+		/* Diagnostic: which real encoder a filter ended up on is otherwise
+		 * invisible until something goes wrong (e.g. a filter accidentally
+		 * inheriting/landing on a hardware encoder already under load from
+		 * the main output or other filters -- see check_encoder_overload).
+		 * One line per encoder (re)creation, not per frame. */
+		blog(LOG_INFO, "[Source Record] '%s': using encoder '%s'%s", obs_source_get_name(filter->source), enc_id,
+		     filter->encoder ? "" : " (FAILED TO CREATE)");
 
 		obs_encoder_set_video(filter->encoder, filter->video_output);
 		uint32_t divisor = (uint32_t)obs_data_get_int(settings, "frame_rate_divisor");
@@ -1862,9 +1869,13 @@ static void check_encoder_overload(struct source_record_filter_context *context,
 	if (context->encoder_overload_check_accum < 2.0f)
 		return;
 	context->encoder_overload_check_accum = 0.0f;
-
-	if (!vendor)
-		return; // obs-websocket isn't installed/loaded -- nothing to emit to
+	/* Deliberately NOT gated on `vendor` here anymore -- it used to return
+	 * immediately if obs-websocket wasn't loaded, which meant this filter's
+	 * own drop-rate diagnostics went completely dark (no OBS log line
+	 * either) for anyone not running Backtrack/obs-websocket. The vendor
+	 * event is still only emitted when vendor is available; local logging
+	 * below always runs regardless, so `Encoding overloaded` can be
+	 * root-caused from the OBS log alone. */
 
 	obs_output_t *own_output = context->fileOutput && obs_output_active(context->fileOutput)     ? context->fileOutput
 				    : context->replayOutput && obs_output_active(context->replayOutput) ? context->replayOutput
@@ -1897,6 +1908,14 @@ static void check_encoder_overload(struct source_record_filter_context *context,
 	if (!own_bad && !rec_bad && !stream_bad && !replay_bad)
 		return;
 
+	blog(LOG_WARNING,
+	     "[Source Record] '%s': encoder overload (dropped frames last ~2s -- this filter: %.1f%%, "
+	     "main recording: %.1f%%, main stream: %.1f%%, main replay buffer: %.1f%%)",
+	     obs_source_get_name(context->source), own_rate, rec_rate, stream_rate, replay_rate);
+
+	if (!vendor)
+		return; // obs-websocket isn't installed/loaded -- nothing to emit to, logged above regardless
+
 	obs_data_t *event_data = obs_data_create();
 	obs_data_set_bool(event_data, "this_filter", own_bad);
 	obs_data_set_bool(event_data, "main_recording", rec_bad);
@@ -1914,6 +1933,44 @@ static void check_encoder_overload(struct source_record_filter_context *context,
 	obs_data_set_string(event_data, "filter", obs_source_get_name(context->source));
 	obs_websocket_vendor_emit_event(vendor, "encoder_overload", event_data);
 	obs_data_release(event_data);
+}
+
+/* Whether this filter currently needs its own obs_view/video_output mix at
+ * all. That mix (created via obs_view_add2 below) is not a passive data
+ * holder -- once registered, libobs's single shared video thread renders a
+ * full extra composited scene for it every single output frame for as long
+ * as it exists (obs-video.c: output_frames() -> output_frame() ->
+ * render_video() -> render_main_texture(), unconditionally, for every mix in
+ * obs->video.mixes -- verified against the actual OBS 32.1.2 source). That
+ * cost was previously paid for the filter's entire lifetime, the moment the
+ * parent had a valid size, regardless of whether record/stream/replay was
+ * even turned on. With several filters on a scene collection (this fork's
+ * whole point -- one filter per source, each with its own up-to-4-overlay
+ * composite) most of them idle at any moment, that meant every idle filter
+ * was still fully rendering its own scene every frame on the one thread OBS
+ * also uses for the main program output -- a real, avoidable contributor to
+ * "Encoding overloaded" that has nothing to do with bitrate/resolution/fps.
+ * Gate mix creation on actually needing it, and tear it down once nothing
+ * needs it anymore, so an idle filter costs the video thread nothing. */
+static bool filter_needs_video_pipeline(struct source_record_filter_context *context)
+{
+	/* Deliberately NOT including context->output_active here -- it's only
+	 * cleared by two specific tick() branches (parent hidden/disabled, and
+	 * resize/restart), not by source_record_filter_update()'s own direct
+	 * stop-on-settings-change path (record_mode/stream_mode/replay_buffer
+	 * flipped off while the source stays visible and enabled), so it can
+	 * sit stuck true long after nothing is actually running. encoder_active
+	 * is the reliable signal instead: obs_encoder_active() is a real
+	 * ref-count internal to libobs (obs-encoder.c's add_connection/
+	 * remove_connection, incremented on obs_encoder_start, decremented on
+	 * obs_encoder_stop) that only goes false once every output still
+	 * attached to this encoder -- file, stream, and replay buffer share the
+	 * one encoder object -- has fully finished its own async drain
+	 * (obs_output_end_data_capture's end_data_capture_thread), regardless
+	 * of which of the three paths triggered the stop. */
+	return context->record || context->stream || context->replayBuffer || context->starting_file_output ||
+	       context->starting_stream_output || context->starting_replay_output ||
+	       (context->encoder && obs_encoder_active(context->encoder));
 }
 
 static void source_record_filter_tick(void *data, float seconds)
@@ -1965,8 +2022,9 @@ static void source_record_filter_tick(void *data, float seconds)
 	 * focus change) used to call obs_view_remove() immediately, freeing the
 	 * video_output under a running encoder + replay buffer -> crash. */
 	const bool size_changed = width && height && (context->width != width || context->height != height);
+	const bool needs_pipeline = filter_needs_video_pipeline(context);
 
-	if (width && height && !context->video_output) {
+	if (width && height && needs_pipeline && !context->video_output) {
 		struct obs_video_info ovi = {0};
 		obs_get_video_info(&ovi);
 
@@ -1982,7 +2040,20 @@ static void source_record_filter_tick(void *data, float seconds)
 		if (context->video_output) {
 			context->width = width;
 			context->height = height;
+			blog(LOG_INFO, "[Source Record] '%s': video pipeline started (%ux%u)",
+			     obs_source_get_name(context->source), width, height);
 		}
+	} else if (!needs_pipeline && context->video_output) {
+		/* Safe by the same invariant as the resize-swap branch below: only
+		 * tear down once nothing (including a still-winding-down encoder)
+		 * is using it. needs_pipeline already covers that, so this is just
+		 * the mirror image of the creation branch above. */
+		obs_view_remove(context->view);
+		context->video_output = NULL;
+		context->width = 0;
+		context->height = 0;
+		blog(LOG_INFO, "[Source Record] '%s': video pipeline stopped (idle -- nothing to record/stream/buffer)",
+		     obs_source_get_name(context->source));
 	} else if (size_changed && context->video_output) {
 		if (context->output_active) {
 			/* defer: let the restart branch stop the outputs first */
