@@ -1500,26 +1500,36 @@ static void source_record_filter_defaults(obs_data_t *settings)
 
 	obs_data_set_default_int(settings, "backgroundColor", 0);
 
-	// Deliberately NOT matched to the main recording/stream's own encoder
-	// choice anymore (this used to follow AdvOut's RecEncoder/Encoder or
-	// SimpleOutput's RecEncoder/StreamEncoder) -- if the main output already
-	// uses NVENC, which is common, every brand new Source Record filter
-	// silently defaulted to NVENC too, piling up concurrent hardware encoder
-	// sessions on a GPU with a real per-chip throughput ceiling (reported
-	// live: main stream + this filter alone was enough to peg an RTX 3080's
-	// single NVENC chip at 100%, dropping frames). Software encoding is a
-	// safer default for a *secondary* recording specifically -- most modern
-	// CPUs have real headroom for one background x264 encode, and NVENC
-	// should stay reserved for whatever actually needs to be real-time.
-	// Users who genuinely want NVENC for a filter can still pick it
-	// explicitly in its properties; this only changes what a brand new
-	// filter starts as. Lossless is the one exception kept as-is -- that's a
-	// hard requirement (a specific encoder), not a load-balancing choice.
-	const char *enc_id = "x264";
-	if (!adv_out) {
+	// Reverted back to matching the main recording/stream's own encoder
+	// choice (briefly changed to always default new filters to Software/x264
+	// instead, to avoid piling concurrent NVENC sessions onto a GPU's real
+	// per-chip throughput ceiling -- see git history). That tradeoff went
+	// the other way in practice: reported live as a friend's CPU pegged at
+	// 80% and lagging everything, including their stream, once a filter's
+	// own x264 encode was competing with the main output for CPU time
+	// instead. Matching the main output's own choice is the safer default
+	// again -- if that's already NVENC, at least it's hardware encoding
+	// either way, and users who want a specific encoder for a filter can
+	// still pick it explicitly. check_encoder_overload (below) stays either
+	// way -- detecting/reporting real contention is still useful regardless
+	// of which default caused it.
+	const char *enc_id;
+	if (adv_out) {
+		enc_id = config_get_string(config, "AdvOut", "RecEncoder");
+		if (strcmp(enc_id, "none") == 0 || strcmp(enc_id, "None") == 0)
+			enc_id = config_get_string(config, "AdvOut", "Encoder");
+		else if (strcmp(enc_id, "jim_nvenc") == 0 || strcmp(enc_id, "obs_nvenc_h264_tex") == 0)
+			enc_id = "nvenc";
+
+	} else {
 		const char *quality = config_get_string(config, "SimpleOutput", "RecQuality");
-		if (strcmp(quality, "Lossless") == 0 || strcmp(quality, "lossless") == 0)
+		if (strcmp(quality, "Stream") == 0 || strcmp(quality, "stream") == 0) {
+			enc_id = config_get_string(config, "SimpleOutput", "StreamEncoder");
+		} else if (strcmp(quality, "Lossless") == 0 || strcmp(quality, "lossless") == 0) {
 			enc_id = "ffmpeg_output";
+		} else {
+			enc_id = config_get_string(config, "SimpleOutput", "RecEncoder");
+		}
 	}
 	obs_data_set_default_string(settings, "encoder", enc_id);
 
