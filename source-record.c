@@ -848,15 +848,26 @@ static void start_file_output(struct source_record_filter_context *filter, obs_d
 	if (!filter->fileOutput || strcmp(obs_output_get_id(filter->fileOutput), output_id) != 0) {
 		obs_output_release(filter->fileOutput);
 		filter->fileOutput = obs_output_create(output_id, obs_source_get_name(filter->source), s, NULL);
-		signal_handler_t *sh = obs_output_get_signal_handler(filter->fileOutput);
-		signal_handler_connect(sh, "stop", source_record_file_stopped, filter);
-		if (filter->remove_after_record) {
-			signal_handler_connect(sh, "stop", remove_filter, filter);
+		if (filter->fileOutput) {
+			signal_handler_t *sh = obs_output_get_signal_handler(filter->fileOutput);
+			signal_handler_connect(sh, "stop", source_record_file_stopped, filter);
+			if (filter->remove_after_record) {
+				signal_handler_connect(sh, "stop", remove_filter, filter);
+			}
 		}
 	} else {
 		obs_output_update(filter->fileOutput, s);
 	}
 	obs_data_release(s);
+	if (!filter->fileOutput) {
+		/* obs_output_create failed (bad output_id, OOM, disallowed disk,
+		 * etc.) -- without this check the filter would silently believe
+		 * it's recording forever: starting_file_output would get set below
+		 * against a NULL output, and record_error only ever flips on a
+		 * "stop" signal that a nonexistent output can never fire. */
+		filter->record_error = true;
+		return;
+	}
 	if (filter->encoder) {
 		update_video_encoder(filter, settings);
 		obs_output_set_video_encoder(filter->fileOutput, filter->encoder);
@@ -934,6 +945,13 @@ static void start_stream_output(struct source_record_filter_context *filter, obs
 
 	if (!filter->streamOutput) {
 		filter->streamOutput = obs_output_create(type, obs_source_get_name(filter->source), settings, NULL);
+		if (!filter->streamOutput) {
+			/* Same silent-stuck-state risk as start_file_output's own
+			 * creation-failure check -- without this, the filter would
+			 * mark itself as streaming with a NULL output and no way to
+			 * ever report failure back out. */
+			return;
+		}
 	} else {
 		obs_output_update(filter->streamOutput, settings);
 	}
@@ -980,18 +998,24 @@ static void start_replay_output(struct source_record_filter_context *filter, obs
 		}
 
 		filter->replayOutput = obs_output_create("replay_buffer", name.array, s, hotkeys);
-		filter->replay_error = false;
+		filter->replay_error = !filter->replayOutput;
 		signal_handler_t *sh = obs_output_get_signal_handler(filter->replayOutput);
 		if (sh) {
 			signal_handler_connect(sh, "saved", source_record_replay_saved, filter);
 			signal_handler_connect(sh, "stop", source_record_replay_stopped, filter);
-		}
-		if (filter->remove_after_record) {
-			sh = obs_output_get_signal_handler(filter->replayOutput);
-			signal_handler_connect(sh, "stop", remove_filter, filter);
+			if (filter->remove_after_record) {
+				signal_handler_connect(sh, "stop", remove_filter, filter);
+			}
 		}
 		dstr_free(&name);
 		obs_data_release(hotkeys);
+		if (!filter->replayOutput) {
+			/* Same silent-stuck-state risk as start_file_output's own
+			 * creation-failure check -- bail before starting_replay_output
+			 * gets set and the dereferences below run against NULL. */
+			obs_data_release(s);
+			return;
+		}
 	} else {
 		obs_output_update(filter->replayOutput, s);
 	}
@@ -1503,9 +1527,14 @@ static void source_record_filter_update(void *data, obs_data_t *settings)
 			}
 		} else {
 			obs_source_t *source = obs_weak_source_get_source(filter->audio_source);
+			/* Read the name (and only then release) -- releasing first and
+			 * reading obs_source_get_name(source) after was a use-after-free
+			 * whenever this ref happened to be the last one (i.e. exactly
+			 * the orphaned-weak-ref case being detected here). */
+			bool name_changed = !source || strcmp(source_name, obs_source_get_name(source)) != 0;
 			if (source)
 				obs_source_release(source);
-			if (!source || strcmp(source_name, obs_source_get_name(source)) != 0) {
+			if (name_changed) {
 				if (filter->audio_source) {
 					obs_weak_source_release(filter->audio_source);
 					filter->audio_source = NULL;
@@ -2905,11 +2934,18 @@ static bool pause_record_source(obs_source_t *source, obs_data_t *request_data, 
 	if (!filter)
 		return false;
 
+	/* context belongs to filter -- read it before releasing our ref, not
+	 * after (a release-then-use ordering bug: this vendor call can race an
+	 * async filter removal on another thread, in which case this ref could
+	 * be the last one and releasing it first would free context out from
+	 * under the dereference below). */
 	struct source_record_filter_context *context = obs_obj_get_data(filter);
-	obs_source_release(filter);
-	if (!context->fileOutput)
+	if (!context->fileOutput) {
+		obs_source_release(filter);
 		return false;
+	}
 	obs_output_pause(context->fileOutput, true);
+	obs_source_release(filter);
 	return true;
 }
 
@@ -2919,11 +2955,14 @@ static bool unpause_record_source(obs_source_t *source, obs_data_t *request_data
 	if (!filter)
 		return false;
 
+	/* See pause_record_source's comment above -- same release-after-use fix. */
 	struct source_record_filter_context *context = obs_obj_get_data(filter);
-	obs_source_release(filter);
-	if (!context->fileOutput)
+	if (!context->fileOutput) {
+		obs_source_release(filter);
 		return false;
+	}
 	obs_output_pause(context->fileOutput, false);
+	obs_source_release(filter);
 	return true;
 }
 
@@ -2933,19 +2972,19 @@ static bool split_record_source(obs_source_t *source, obs_data_t *request_data, 
 	if (!filter)
 		return false;
 
+	/* See pause_record_source's comment above -- same release-after-use fix. */
 	struct source_record_filter_context *context = obs_obj_get_data(filter);
-	obs_source_release(filter);
-	if (!context->fileOutput)
+	if (!context->fileOutput) {
+		obs_source_release(filter);
 		return false;
+	}
 	proc_handler_t *ph = obs_output_get_proc_handler(context->fileOutput);
 	struct calldata cd;
 	calldata_init(&cd);
-	if (!proc_handler_call(ph, "split_file", &cd)) {
-		calldata_free(&cd);
-		return false;
-	}
+	bool ok = proc_handler_call(ph, "split_file", &cd);
 	calldata_free(&cd);
-	return true;
+	obs_source_release(filter);
+	return ok;
 }
 
 static bool add_chapter_record_source(obs_source_t *source, obs_data_t *request_data, obs_data_t *response_data)
@@ -2954,20 +2993,20 @@ static bool add_chapter_record_source(obs_source_t *source, obs_data_t *request_
 	if (!filter)
 		return false;
 
+	/* See pause_record_source's comment above -- same release-after-use fix. */
 	struct source_record_filter_context *context = obs_obj_get_data(filter);
-	obs_source_release(filter);
-	if (!context->fileOutput)
+	if (!context->fileOutput) {
+		obs_source_release(filter);
 		return false;
+	}
 	proc_handler_t *ph = obs_output_get_proc_handler(context->fileOutput);
 	struct calldata cd;
 	calldata_init(&cd);
 	calldata_set_string(&cd, "chapter_name", obs_data_get_string(request_data, "chapter_name"));
-	if (!proc_handler_call(ph, "add_chapter", &cd)) {
-		calldata_free(&cd);
-		return false;
-	}
+	bool ok = proc_handler_call(ph, "add_chapter", &cd);
 	calldata_free(&cd);
-	return true;
+	obs_source_release(filter);
+	return ok;
 }
 
 static bool stop_record_source(obs_source_t *source, obs_data_t *request_data, obs_data_t *response_data)
