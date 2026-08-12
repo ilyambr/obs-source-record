@@ -50,6 +50,7 @@ struct source_record_filter_context {
 	bool replayBuffer;
 	obs_hotkey_pair_id enableHotkey;
 	obs_hotkey_pair_id pauseHotkeys;
+	obs_hotkey_pair_id recordHotkeys;
 	obs_hotkey_id splitHotkey;
 	obs_hotkey_id chapterHotkey;
 	int audio_track;
@@ -497,6 +498,54 @@ static bool find_hotkey_binding_cb(void *data, size_t idx, obs_hotkey_binding_t 
 	return false;
 }
 
+struct find_named_source_hotkey_ctx {
+	/* Several distinct hotkeys (enable/disable, pause/unpause, split,
+	 * chapter, start/stop record, ...) all register against the same
+	 * parent source, so registerer alone isn't enough to pick one out --
+	 * this also matches on the hotkey's own registration name. */
+	obs_weak_source_t *target_weak;
+	const char *name;
+	obs_hotkey_id id;
+};
+
+static bool find_named_source_hotkey_cb(void *data, obs_hotkey_id id, obs_hotkey_t *key)
+{
+	struct find_named_source_hotkey_ctx *ctx = data;
+	if (obs_hotkey_get_registerer_type(key) != OBS_HOTKEY_REGISTERER_SOURCE)
+		return true;
+	if (obs_hotkey_get_registerer(key) != (void *)ctx->target_weak)
+		return true;
+	if (strcmp(obs_hotkey_get_name(key), ctx->name) != 0)
+		return true;
+	ctx->id = id;
+	return false;
+}
+
+/* Same idea as get_output_hotkey_str below, but for a single hotkey
+ * registered on `parent` (obs_hotkey_register_source /
+ * obs_hotkey_pair_register_source) and identified by its registration name
+ * -- e.g. "source_record.StartRecording" -- rather than by registerer type
+ * alone. Leaves `str` empty if the hotkey isn't found or has no binding. */
+static void get_source_hotkey_str(obs_source_t *parent, const char *hotkey_name, struct dstr *str)
+{
+	dstr_free(str);
+	if (!parent)
+		return;
+
+	obs_weak_source_t *weak_parent = obs_source_get_weak_source(parent);
+	struct find_named_source_hotkey_ctx find_ctx = {weak_parent, hotkey_name, OBS_INVALID_HOTKEY_ID};
+	obs_enum_hotkeys(find_named_source_hotkey_cb, &find_ctx);
+	if (weak_parent)
+		obs_weak_source_release(weak_parent);
+	if (find_ctx.id == OBS_INVALID_HOTKEY_ID)
+		return;
+
+	struct find_hotkey_binding_ctx bind_ctx = {find_ctx.id, {0}, false};
+	obs_enum_hotkey_bindings(find_hotkey_binding_cb, &bind_ctx);
+	if (bind_ctx.found)
+		obs_key_combination_to_str(bind_ctx.combo, str);
+}
+
 /* Finds the (single) hotkey the "replay_buffer" output type registers for
  * itself and writes its bound key combination (e.g. "F8") into `str`, or
  * leaves `str` empty if the output has no hotkey or it is unbound. */
@@ -521,15 +570,16 @@ static void get_output_hotkey_str(obs_output_t *output, struct dstr *str)
 }
 
 /* Mirrors get_replay_buffer_status_proc below, but for the filter's own file
- * recording -- no dedicated per-filter record hotkey (only pause/split), so
- * this just reports whether record_mode currently resolves to on, whether
+ * recording: reports whether record_mode currently resolves to on, whether
  * the file output is actually running, whether the last stop was a failure
- * rather than a normal one (mirrors replay_error), and the exact resolved
- * path of the most recent (or current) recording -- same idea as ffmpeg-mux's
- * own get_last_replay proc, which only exists for the replay-buffer output
- * variant, not this one. Lets external docks (e.g. obs-replay-slider's
- * control panel) show live status without duplicating this filter's own
- * record_mode bookkeeping. */
+ * rather than a normal one (mirrors replay_error), the exact resolved path
+ * of the most recent (or current) recording -- same idea as ffmpeg-mux's own
+ * get_last_replay proc, which only exists for the replay-buffer output
+ * variant, not this one -- and the bound key combination (if any) for the
+ * "source_record.StartRecording" hotkey registered below, same shape as
+ * get_replay_buffer_status_proc's own "hotkey" field. Lets external docks
+ * (e.g. obs-replay-slider's control panel) show live status without
+ * duplicating this filter's own record_mode bookkeeping. */
 static void get_record_status_proc(void *data, calldata_t *cd)
 {
 	struct source_record_filter_context *context = data;
@@ -537,6 +587,12 @@ static void get_record_status_proc(void *data, calldata_t *cd)
 	calldata_set_bool(cd, "active", context->fileOutput && obs_output_active(context->fileOutput));
 	calldata_set_bool(cd, "error", context->record_error);
 	calldata_set_string(cd, "path", context->last_output_path.array ? context->last_output_path.array : "");
+
+	struct dstr hotkey_str;
+	dstr_init(&hotkey_str);
+	get_source_hotkey_str(obs_filter_get_parent(context->source), "source_record.StartRecording", &hotkey_str);
+	calldata_set_string(cd, "hotkey", hotkey_str.array ? hotkey_str.array : "");
+	dstr_free(&hotkey_str);
 }
 
 static void get_replay_buffer_status_proc(void *data, calldata_t *cd)
@@ -1581,6 +1637,7 @@ static void *source_record_filter_create(obs_data_t *settings, obs_source_t *sou
 	context->last_frontend_event = -1;
 	context->enableHotkey = OBS_INVALID_HOTKEY_PAIR_ID;
 	context->pauseHotkeys = OBS_INVALID_HOTKEY_PAIR_ID;
+	context->recordHotkeys = OBS_INVALID_HOTKEY_PAIR_ID;
 	context->splitHotkey = OBS_INVALID_HOTKEY_ID;
 	context->chapterHotkey = OBS_INVALID_HOTKEY_ID;
 
@@ -1589,7 +1646,9 @@ static void *source_record_filter_create(obs_data_t *settings, obs_source_t *sou
 		proc_handler_add(ph, "void get_replay_buffer_status(out bool enabled, out bool active, out bool error, out string hotkey)",
 				 get_replay_buffer_status_proc, context);
 		proc_handler_add(ph, "void save_replay_buffer(out bool success)", save_replay_buffer_proc, context);
-		proc_handler_add(ph, "void get_record_status(out bool enabled, out bool active, out bool error, out string path)", get_record_status_proc, context);
+		proc_handler_add(ph,
+				 "void get_record_status(out bool enabled, out bool active, out bool error, out string path, out string hotkey)",
+				 get_record_status_proc, context);
 	}
 
 	signal_handler_t *filter_sh = obs_source_get_signal_handler(source);
@@ -1623,6 +1682,9 @@ static void source_record_filter_destroy(void *data)
 
 	if (context->pauseHotkeys != OBS_INVALID_HOTKEY_PAIR_ID)
 		obs_hotkey_pair_unregister(context->pauseHotkeys);
+
+	if (context->recordHotkeys != OBS_INVALID_HOTKEY_PAIR_ID)
+		obs_hotkey_pair_unregister(context->recordHotkeys);
 
 	if (context->splitHotkey != OBS_INVALID_HOTKEY_ID)
 		obs_hotkey_unregister(context->splitHotkey);
@@ -1716,6 +1778,48 @@ static bool source_record_disable_hotkey(void *data, obs_hotkey_pair_id id, obs_
 	if (!obs_source_enabled(context->source))
 		return false;
 	obs_source_set_enabled(context->source, false);
+	return true;
+}
+
+/* Same "start_mode = ALWAYS" / "record_mode = NONE" settings update that
+ * websocket_start_record/websocket_stop_record (and the REST-ish vendor
+ * requests they back) apply -- these just apply it directly to this
+ * filter's own context->source rather than resolving a filter by name off a
+ * caller-supplied source, since the hotkey callback already has the exact
+ * filter instance it fired on. */
+static bool source_record_start_record_hotkey(void *data, obs_hotkey_pair_id id, obs_hotkey_t *hotkey, bool pressed)
+{
+	UNUSED_PARAMETER(id);
+	UNUSED_PARAMETER(hotkey);
+	struct source_record_filter_context *context = data;
+	if (!pressed)
+		return false;
+
+	if (context->record)
+		return false;
+
+	obs_data_t *settings = obs_data_create();
+	obs_data_set_int(settings, "record_mode", OUTPUT_MODE_ALWAYS);
+	obs_source_update(context->source, settings);
+	obs_data_release(settings);
+	return true;
+}
+
+static bool source_record_stop_record_hotkey(void *data, obs_hotkey_pair_id id, obs_hotkey_t *hotkey, bool pressed)
+{
+	UNUSED_PARAMETER(id);
+	UNUSED_PARAMETER(hotkey);
+	struct source_record_filter_context *context = data;
+	if (!pressed)
+		return false;
+
+	if (!context->record)
+		return false;
+
+	obs_data_t *settings = obs_data_create();
+	obs_data_set_int(settings, "record_mode", OUTPUT_MODE_NONE);
+	obs_source_update(context->source, settings);
+	obs_data_release(settings);
 	return true;
 }
 
@@ -2012,6 +2116,16 @@ static void source_record_filter_tick(void *data, float seconds)
 			parent, "source_record.PauseRecording", obs_frontend_get_locale_string("Basic.Main.PauseRecording"),
 			"source_record.UnpauseRecording", obs_frontend_get_locale_string("Basic.Main.UnpauseRecording"),
 			source_record_pause_hotkey, source_record_unpause_hotkey, context, context);
+
+	// Distinct from enableHotkey above -- Enable/Disable toggles the whole
+	// filter (replay buffer AND recording, whichever record_mode/replay
+	// settings resolve to), while this pair only ever touches record_mode,
+	// same scope as the record_start/record_stop websocket vendor requests.
+	if (context->recordHotkeys == OBS_INVALID_HOTKEY_PAIR_ID)
+		context->recordHotkeys = obs_hotkey_pair_register_source(
+			parent, "source_record.StartRecording", obs_module_text("SourceRecordStartRecording"),
+			"source_record.StopRecording", obs_module_text("SourceRecordStopRecording"),
+			source_record_start_record_hotkey, source_record_stop_record_hotkey, context, context);
 
 	if (context->splitHotkey == OBS_INVALID_HOTKEY_ID)
 		context->splitHotkey = obs_hotkey_register_source(parent, "source_record.SplitRecording",
