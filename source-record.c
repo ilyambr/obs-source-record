@@ -586,6 +586,15 @@ static void get_record_status_proc(void *data, calldata_t *cd)
 	calldata_set_bool(cd, "enabled", context->record);
 	calldata_set_bool(cd, "active", context->fileOutput && obs_output_active(context->fileOutput));
 	calldata_set_bool(cd, "error", context->record_error);
+	/* source_hidden_in_scene is update_hidden_record_mode's own tracked state
+	 * (see its own comment) -- ticks every 0.5s off video_tick regardless of
+	 * whether this source is showing anywhere, so it's always fresh here.
+	 * Exposed so an external dock (obs-replay-slider) can distinguish "hidden
+	 * in its scene" from "just not recording" without re-deriving the same
+	 * per-scene-item-visibility check itself (a naive obs_source_active()
+	 * check was already tried there and reverted -- see that file's own
+	 * comment on why it's a worse signal than this one). */
+	calldata_set_bool(cd, "hidden", context->source_hidden_in_scene);
 	calldata_set_string(cd, "path", context->last_output_path.array ? context->last_output_path.array : "");
 
 	struct dstr hotkey_str;
@@ -1675,9 +1684,10 @@ static void *source_record_filter_create(obs_data_t *settings, obs_source_t *sou
 		proc_handler_add(ph, "void get_replay_buffer_status(out bool enabled, out bool active, out bool error, out string hotkey)",
 				 get_replay_buffer_status_proc, context);
 		proc_handler_add(ph, "void save_replay_buffer(out bool success)", save_replay_buffer_proc, context);
-		proc_handler_add(ph,
-				 "void get_record_status(out bool enabled, out bool active, out bool error, out string path, out string hotkey)",
-				 get_record_status_proc, context);
+		proc_handler_add(
+			ph,
+			"void get_record_status(out bool enabled, out bool active, out bool error, out bool hidden, out string path, out string hotkey)",
+			get_record_status_proc, context);
 	}
 
 	signal_handler_t *filter_sh = obs_source_get_signal_handler(source);
