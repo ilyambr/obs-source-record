@@ -1943,9 +1943,10 @@ static bool source_hidden_in_current_scene(obs_source_t *parent)
 	return hidden;
 }
 
-// Forces record_mode to None while the source is hidden in the current
-// scene, and restores whatever it was set to beforehand once it's shown
-// again (staying None if that's what it already was).
+// Forces record_mode to None (and disables the filter itself, for the eye
+// icon -- see below) while the source is hidden in the current scene, and
+// restores both once it's shown again (record_mode staying None if that's
+// what it already was).
 //
 // Enforces the invariant every 0.5s, not just once on the hidden/shown
 // TRANSITION -- the previous version wrote the new record_mode exactly once
@@ -1969,6 +1970,19 @@ static void update_hidden_record_mode(struct source_record_filter_context *conte
 
 	const bool hidden = source_hidden_in_current_scene(parent);
 	context->source_hidden_in_scene = hidden;
+
+	// Keeps the filter's own eye icon in the Filters list in sync with
+	// `hidden` too -- record_mode alone (below) already stops the actual
+	// output, but left the icon looking permanently "on" regardless, which
+	// read as this feature not doing anything at all. Same self-verifying
+	// pattern as record_mode below (checked every interval, not just
+	// applied once and trusted): confirmed live against libobs's own
+	// tick_sources (obs-video.c) that every loaded source, filters
+	// included, keeps getting ticked regardless of enabled state -- so a
+	// disabled filter can still notice being shown again and re-enable
+	// itself; it can't get stuck disabled.
+	if (obs_source_enabled(context->source) == hidden)
+		obs_source_set_enabled(context->source, !hidden);
 
 	obs_data_t *current_settings = obs_source_get_settings(context->source);
 	const long long current_mode = obs_data_get_int(current_settings, "record_mode");
