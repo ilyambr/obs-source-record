@@ -1946,6 +1946,20 @@ static bool source_hidden_in_current_scene(obs_source_t *parent)
 // Forces record_mode to None while the source is hidden in the current
 // scene, and restores whatever it was set to beforehand once it's shown
 // again (staying None if that's what it already was).
+//
+// Enforces the invariant every 0.5s, not just once on the hidden/shown
+// TRANSITION -- the previous version wrote the new record_mode exactly once
+// per transition and immediately considered the job done (record_mode_
+// hidden_override cleared unconditionally in the un-hide branch, before
+// even checking whether the restore write actually landed). If that single
+// obs_source_update() ever got lost or stomped by something else touching
+// this filter's settings around the same time (its own properties dialog
+// being open and saving stale state is the obvious candidate, though not
+// confirmed), nothing would ever notice or retry -- it'd just sit silently
+// wrong until the next real hide/show transition. Now it re-checks and
+// re-applies every interval regardless, and only clears the override flag
+// once the setting is actually confirmed to match, not on faith that the
+// write succeeded.
 static void update_hidden_record_mode(struct source_record_filter_context *context, obs_source_t *parent, float seconds)
 {
 	context->visibility_check_accum += seconds;
@@ -1954,16 +1968,16 @@ static void update_hidden_record_mode(struct source_record_filter_context *conte
 	context->visibility_check_accum = 0.0f;
 
 	const bool hidden = source_hidden_in_current_scene(parent);
-	if (hidden == context->source_hidden_in_scene)
-		return;
 	context->source_hidden_in_scene = hidden;
 
 	obs_data_t *current_settings = obs_source_get_settings(context->source);
 	const long long current_mode = obs_data_get_int(current_settings, "record_mode");
 
 	if (hidden) {
-		context->saved_record_mode = current_mode;
-		context->record_mode_hidden_override = true;
+		if (!context->record_mode_hidden_override) {
+			context->saved_record_mode = current_mode;
+			context->record_mode_hidden_override = true;
+		}
 		if (current_mode != OUTPUT_MODE_NONE) {
 			obs_data_t *update = obs_data_create();
 			obs_data_set_int(update, "record_mode", OUTPUT_MODE_NONE);
@@ -1971,12 +1985,13 @@ static void update_hidden_record_mode(struct source_record_filter_context *conte
 			obs_data_release(update);
 		}
 	} else if (context->record_mode_hidden_override) {
-		context->record_mode_hidden_override = false;
 		if (current_mode != context->saved_record_mode) {
 			obs_data_t *update = obs_data_create();
 			obs_data_set_int(update, "record_mode", context->saved_record_mode);
 			obs_source_update(context->source, update);
 			obs_data_release(update);
+		} else {
+			context->record_mode_hidden_override = false;
 		}
 	}
 	obs_data_release(current_settings);
