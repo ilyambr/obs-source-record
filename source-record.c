@@ -586,6 +586,15 @@ static void get_record_status_proc(void *data, calldata_t *cd)
 	calldata_set_bool(cd, "enabled", context->record);
 	calldata_set_bool(cd, "active", context->fileOutput && obs_output_active(context->fileOutput));
 	calldata_set_bool(cd, "error", context->record_error);
+	/* source_hidden_in_scene is update_hidden_record_mode's own tracked state
+	 * (see its own comment) -- ticks every 0.5s off video_tick regardless of
+	 * whether this source is showing anywhere, so it's always fresh here.
+	 * Exposed so an external dock (obs-replay-slider) can distinguish "hidden
+	 * in its scene" from "just not recording" without re-deriving the same
+	 * per-scene-item-visibility check itself (a naive obs_source_active()
+	 * check was already tried there and reverted -- see that file's own
+	 * comment on why it's a worse signal than this one). */
+	calldata_set_bool(cd, "hidden", context->source_hidden_in_scene);
 	calldata_set_string(cd, "path", context->last_output_path.array ? context->last_output_path.array : "");
 
 	struct dstr hotkey_str;
@@ -1675,9 +1684,10 @@ static void *source_record_filter_create(obs_data_t *settings, obs_source_t *sou
 		proc_handler_add(ph, "void get_replay_buffer_status(out bool enabled, out bool active, out bool error, out string hotkey)",
 				 get_replay_buffer_status_proc, context);
 		proc_handler_add(ph, "void save_replay_buffer(out bool success)", save_replay_buffer_proc, context);
-		proc_handler_add(ph,
-				 "void get_record_status(out bool enabled, out bool active, out bool error, out string path, out string hotkey)",
-				 get_record_status_proc, context);
+		proc_handler_add(
+			ph,
+			"void get_record_status(out bool enabled, out bool active, out bool error, out bool hidden, out string path, out string hotkey)",
+			get_record_status_proc, context);
 	}
 
 	signal_handler_t *filter_sh = obs_source_get_signal_handler(source);
@@ -1933,9 +1943,24 @@ static bool source_hidden_in_current_scene(obs_source_t *parent)
 	return hidden;
 }
 
-// Forces record_mode to None while the source is hidden in the current
-// scene, and restores whatever it was set to beforehand once it's shown
-// again (staying None if that's what it already was).
+// Forces record_mode to None (and disables the filter itself, for the eye
+// icon -- see below) while the source is hidden in the current scene, and
+// restores both once it's shown again (record_mode staying None if that's
+// what it already was).
+//
+// Enforces the invariant every 0.5s, not just once on the hidden/shown
+// TRANSITION -- the previous version wrote the new record_mode exactly once
+// per transition and immediately considered the job done (record_mode_
+// hidden_override cleared unconditionally in the un-hide branch, before
+// even checking whether the restore write actually landed). If that single
+// obs_source_update() ever got lost or stomped by something else touching
+// this filter's settings around the same time (its own properties dialog
+// being open and saving stale state is the obvious candidate, though not
+// confirmed), nothing would ever notice or retry -- it'd just sit silently
+// wrong until the next real hide/show transition. Now it re-checks and
+// re-applies every interval regardless, and only clears the override flag
+// once the setting is actually confirmed to match, not on faith that the
+// write succeeded.
 static void update_hidden_record_mode(struct source_record_filter_context *context, obs_source_t *parent, float seconds)
 {
 	context->visibility_check_accum += seconds;
@@ -1944,16 +1969,29 @@ static void update_hidden_record_mode(struct source_record_filter_context *conte
 	context->visibility_check_accum = 0.0f;
 
 	const bool hidden = source_hidden_in_current_scene(parent);
-	if (hidden == context->source_hidden_in_scene)
-		return;
 	context->source_hidden_in_scene = hidden;
+
+	// Keeps the filter's own eye icon in the Filters list in sync with
+	// `hidden` too -- record_mode alone (below) already stops the actual
+	// output, but left the icon looking permanently "on" regardless, which
+	// read as this feature not doing anything at all. Same self-verifying
+	// pattern as record_mode below (checked every interval, not just
+	// applied once and trusted): confirmed live against libobs's own
+	// tick_sources (obs-video.c) that every loaded source, filters
+	// included, keeps getting ticked regardless of enabled state -- so a
+	// disabled filter can still notice being shown again and re-enable
+	// itself; it can't get stuck disabled.
+	if (obs_source_enabled(context->source) == hidden)
+		obs_source_set_enabled(context->source, !hidden);
 
 	obs_data_t *current_settings = obs_source_get_settings(context->source);
 	const long long current_mode = obs_data_get_int(current_settings, "record_mode");
 
 	if (hidden) {
-		context->saved_record_mode = current_mode;
-		context->record_mode_hidden_override = true;
+		if (!context->record_mode_hidden_override) {
+			context->saved_record_mode = current_mode;
+			context->record_mode_hidden_override = true;
+		}
 		if (current_mode != OUTPUT_MODE_NONE) {
 			obs_data_t *update = obs_data_create();
 			obs_data_set_int(update, "record_mode", OUTPUT_MODE_NONE);
@@ -1961,12 +1999,13 @@ static void update_hidden_record_mode(struct source_record_filter_context *conte
 			obs_data_release(update);
 		}
 	} else if (context->record_mode_hidden_override) {
-		context->record_mode_hidden_override = false;
 		if (current_mode != context->saved_record_mode) {
 			obs_data_t *update = obs_data_create();
 			obs_data_set_int(update, "record_mode", context->saved_record_mode);
 			obs_source_update(context->source, update);
 			obs_data_release(update);
+		} else {
+			context->record_mode_hidden_override = false;
 		}
 	}
 	obs_data_release(current_settings);
