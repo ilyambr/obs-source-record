@@ -616,7 +616,9 @@ static void get_output_hotkey_str(obs_output_t *output, struct dstr *str)
 /* Mirrors get_replay_buffer_status_proc below, but for the filter's own file
  * recording: reports whether record_mode currently resolves to on, whether
  * the file output is actually running, whether the last stop was a failure
- * rather than a normal one (mirrors replay_error), the exact resolved path
+ * rather than a normal one (mirrors replay_error), whether the source is
+ * hidden in the current scene vs. simply has nothing to capture right now
+ * (own comments on "hidden"/"no_signal" below), the exact resolved path
  * of the most recent (or current) recording -- same idea as ffmpeg-mux's own
  * get_last_replay proc, which only exists for the replay-buffer output
  * variant, not this one -- and the bound key combination (if any) for the
@@ -639,6 +641,20 @@ static void get_record_status_proc(void *data, calldata_t *cd)
 	 * check was already tried there and reverted -- see that file's own
 	 * comment on why it's a worse signal than this one). */
 	calldata_set_bool(cd, "hidden", context->source_hidden_in_scene);
+	/* Distinct from "hidden" above: a source can be fully visible/enabled
+	 * and still have nothing to actually record -- a capture card with no
+	 * device plugged in, a Window Capture with no window selected, a Game
+	 * Capture with nothing hooked, etc. all report 0x0 in that state. This
+	 * is exactly the same signal filter_needs_video_pipeline (further down
+	 * this file) already gates real pipeline creation on, just surfaced
+	 * here too so an external dock (obs-replay-slider) can show "there's
+	 * nothing to capture" instead of a plain "Stopped" that implies
+	 * clicking Start would actually do something. Clicking Start anyway
+	 * (e.g. arming record_mode=Always before the device gets plugged in)
+	 * still works exactly as before -- this is purely an added status
+	 * signal, not a new restriction. */
+	obs_source_t *parent = obs_filter_get_parent(context->source);
+	calldata_set_bool(cd, "no_signal", parent && (!obs_source_get_width(parent) || !obs_source_get_height(parent)));
 	calldata_set_string(cd, "path", context->last_output_path.array ? context->last_output_path.array : "");
 
 	struct dstr hotkey_str;
@@ -1752,7 +1768,7 @@ static void *source_record_filter_create(obs_data_t *settings, obs_source_t *sou
 		proc_handler_add(ph, "void save_replay_buffer(out bool success)", save_replay_buffer_proc, context);
 		proc_handler_add(
 			ph,
-			"void get_record_status(out bool enabled, out bool active, out bool error, out bool hidden, out string path, out string hotkey)",
+			"void get_record_status(out bool enabled, out bool active, out bool error, out bool hidden, out bool no_signal, out string path, out string hotkey)",
 			get_record_status_proc, context);
 	}
 
