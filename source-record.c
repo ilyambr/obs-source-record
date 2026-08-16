@@ -2022,30 +2022,67 @@ static void source_record_chapter_hotkey(void *data, obs_hotkey_id id, obs_hotke
 	calldata_free(&cd);
 }
 
-// True if `parent` isn't visible (or isn't present at all) in the currently
-// active/program scene. Not being in that scene at all counts as hidden too.
-static bool source_hidden_in_current_scene(obs_source_t *parent)
+// True only if `parent` has a real scene item somewhere -- any scene in the
+// collection, not just whichever one happens to be live on program right
+// now -- and every one of those items has its eye icon toggled off.
+//
+// This USED to check only the current program scene, and treated "not
+// present in that scene at all" as hidden too (see the old comment this
+// replaced: "Not being in that scene at all counts as hidden too"). That
+// was a real, confirmed bug, not just a theoretical edge case: it meant
+// switching to ANY other scene -- one that simply doesn't happen to contain
+// this particular source -- paused its recording exactly as if the user had
+// hidden it on purpose, purely because of which scene was live. Confirmed
+// live from a user's log: two Source Record'd sources living in different
+// scenes, rapid switching between those scenes produced 56 real start/stop
+// cycles of their filters within one session, none of which were the user
+// actually hiding anything via an eye icon. Worse than just choppy files:
+// the eye-icon-disable side effect below (obs_source_set_enabled) also
+// stops the REPLAY BUFFER, not just file recording -- so this was silently
+// resetting the buffer's whole rolling window on every scene switch too.
+// This directly undermines the entire point of Source Record, which
+// deliberately forces obs_source_inc_showing() on its own parent
+// specifically so it keeps producing real frames independent of whatever
+// scene happens to be live (see filter_needs_video_pipeline's own comment).
+// "Hide the source" -- the literal feature this is named after, per its own
+// changelog entry -- means the eye icon, in whichever scene(s) the source
+// actually lives in, not "isn't part of the current program scene."
+static bool source_toggled_off_everywhere(obs_source_t *parent)
 {
-	obs_source_t *current_scene_source = obs_frontend_get_current_scene();
-	if (!current_scene_source)
-		return false; // no info available; don't force a change either way
+	struct obs_frontend_source_list scenes = {0};
+	obs_frontend_get_scenes(&scenes);
 
-	bool hidden = true;
-	obs_scene_t *scene = obs_scene_from_source(current_scene_source);
-	if (scene) {
-		const char *name = obs_source_get_name(parent);
-		obs_sceneitem_t *item = name ? obs_scene_find_source_recursive(scene, name) : NULL;
-		if (item)
-			hidden = !obs_sceneitem_visible(item);
+	const char *name = obs_source_get_name(parent);
+	bool found_any = false;
+	bool all_hidden = true;
+
+	for (size_t i = 0; name && i < scenes.sources.num; i++) {
+		obs_scene_t *scene = obs_scene_from_source(scenes.sources.array[i]);
+		if (!scene)
+			continue;
+		obs_sceneitem_t *item = obs_scene_find_source_recursive(scene, name);
+		if (!item)
+			continue;
+		found_any = true;
+		if (obs_sceneitem_visible(item)) {
+			all_hidden = false;
+			break;
+		}
 	}
-	obs_source_release(current_scene_source);
-	return hidden;
+
+	obs_frontend_source_list_free(&scenes);
+	// No scene item anywhere (e.g. a source that was removed from every
+	// scene but the filter's own parent reference is still alive) isn't
+	// "hidden" in any meaningful sense either -- nothing to have an eye
+	// icon on, so nothing is actually toggling it off.
+	return found_any && all_hidden;
 }
 
 // Forces record_mode to None (and disables the filter itself, for the eye
-// icon -- see below) while the source is hidden in the current scene, and
-// restores both once it's shown again (record_mode staying None if that's
-// what it already was).
+// icon -- see below) while the source is toggled off everywhere it appears
+// (source_toggled_off_everywhere's own comment), and restores both once
+// it's shown again (record_mode staying None if that's what it already
+// was).
 //
 // Enforces the invariant every 0.5s, not just once on the hidden/shown
 // TRANSITION -- the previous version wrote the new record_mode exactly once
@@ -2067,7 +2104,7 @@ static void update_hidden_record_mode(struct source_record_filter_context *conte
 		return;
 	context->visibility_check_accum = 0.0f;
 
-	const bool hidden = source_hidden_in_current_scene(parent);
+	const bool hidden = source_toggled_off_everywhere(parent);
 	context->source_hidden_in_scene = hidden;
 
 	// Keeps the filter's own eye icon in the Filters list in sync with
