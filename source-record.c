@@ -130,6 +130,50 @@ static void run_destroy_queued(obs_task_t task, void *param)
 	obs_queue_task(OBS_TASK_DESTROY, task, param, false);
 }
 
+static void noop_task(void *param)
+{
+	UNUSED_PARAMETER(param);
+}
+
+/* release_encoders (queued above via run_destroy_queued from
+ * release_output_stopped/force_stop_output_task) takes `context` itself as
+ * its param, not a raw handle like obs_output_release's calls do -- it needs
+ * to re-check context->record/stream/replayBuffer at the moment it actually
+ * runs, not when it was queued, specifically so a quick re-show/re-enable
+ * that reactivates the SAME encoder in between doesn't get it yanked out
+ * from under the new activity (see release_encoders' own comment). That
+ * live re-check is exactly why it can't just take a raw obs_encoder_t handle
+ * like the output releases do.
+ *
+ * But OBS_TASK_DESTROY is a genuinely separate background thread with no
+ * synchronization against filter_destroy freeing `context` out from under
+ * it -- source_record_filter_destroy can run (and bfree(context)) while an
+ * earlier stop's release_encoders(context) task is still sitting in that
+ * queue, a real cross-thread use-after-free (caught by review, not found
+ * live). Call this right before bfree(context): it queues a genuine no-op
+ * onto the SAME queue and blocks until it's actually run. OBS_TASK_DESTROY
+ * is FIFO, so by the time this returns, everything queued to it earlier --
+ * including any release_encoders(context) for THIS context -- has already
+ * finished, making the free that follows safe. Deliberately only called
+ * from filter_destroy (a rare, deliberate action -- removing the filter, or
+ * OBS closing), not from the routine hide/show path: blocking there would
+ * reintroduce the exact render-thread stall this whole run_destroy_queued
+ * mechanism exists to avoid for the common case.
+ *
+ * Guarded against ever calling this FROM OBS_TASK_DESTROY itself (self-
+ * deadlock, waiting on a queue's own worker thread from inside that same
+ * thread) -- not just defensive: if filter_destroy is somehow already
+ * running as a task ON that queue, the FIFO ordering guarantee this
+ * function exists to provide is already satisfied for free (nothing queued
+ * before it could still be pending), so skipping the wait there is both
+ * safe and correct, not merely deadlock-avoidance. */
+static void wait_for_destroy_queue_drain(void)
+{
+	if (obs_in_task_thread(OBS_TASK_DESTROY))
+		return;
+	obs_queue_task(OBS_TASK_DESTROY, noop_task, NULL, true);
+}
+
 static const char *source_record_filter_get_name(void *unused)
 {
 	UNUSED_PARAMETER(unused);
@@ -644,7 +688,26 @@ void release_output_stopped(void *data, calldata_t *cd)
 		if (so->context->exiting || so->context->closing)
 			release_encoders(so->context);
 		else
-			run_queued(release_encoders, so->context);
+			/* Fix: obs_encoder_release() -> the real hardware/NVENC
+			 * session teardown can itself take a real, sometimes
+			 * multi-second, amount of time (reported live: OBS's
+			 * whole window going white/unresponsive for ~20s, main
+			 * stream bitrate dropping to 0 for the duration --
+			 * triggered by disabling a Source Record filter via its
+			 * Filters-list eye icon, or a scene switch away-and-
+			 * quickly-back that hides then re-shows the source).
+			 * run_queued() put this on OBS_TASK_GRAPHICS/OBS_TASK_UI
+			 * -- the exact same threads the shared video renderer
+			 * and every output (including the main stream) depend
+			 * on staying responsive -- so a slow encoder teardown
+			 * stalled literally everything else sharing that
+			 * thread, not just this filter's own recording. Same
+			 * root cause, same fix, as the obs_output_release()
+			 * line right above (see run_destroy_queued's own
+			 * comment for that original ~30s freeze report) --
+			 * OBS_TASK_DESTROY is the dedicated background thread
+			 * for exactly this kind of expensive teardown work. */
+			run_destroy_queued(release_encoders, so->context);
 	}
 	bfree(data);
 }
@@ -678,9 +741,12 @@ static void force_stop_output_task(void *data)
 		/* No "stop" signal to wait on, so free right away -- but still
 		 * off OBS_TASK_GRAPHICS/OBS_TASK_UI (this function is already
 		 * running on one of those two), for the same reason as the
-		 * signal-driven path in release_output_stopped() above. */
+		 * signal-driven path in release_output_stopped() above --
+		 * including release_encoders, not just obs_output_release
+		 * (see that function's own comment on why: a slow encoder
+		 * teardown freezes everything sharing this thread). */
 		run_destroy_queued((obs_task_t)obs_output_release, so->output);
-		release_encoders(so->context);
+		run_destroy_queued(release_encoders, so->context);
 		bfree(data);
 	}
 }
@@ -1749,11 +1815,21 @@ static void source_record_filter_destroy(void *data)
 	context->streamOutput = NULL;
 	context->replayOutput = NULL;
 
+	/* Same bug, same fix, as the three obs_output_release calls right above
+	 * (whose own comment explains the general reasoning) -- this one was
+	 * ALSO missed the first time: obs_encoder_release can itself be slow
+	 * (a real hardware/NVENC session teardown, not just a free -- see
+	 * release_output_stopped's own comment on this exact cost), and this
+	 * whole function still runs synchronously on the thread destroying the
+	 * filter (removing it from the Filters panel, or OBS closing with it
+	 * still present) -- freezing that thread for however long it takes.
+	 * Only the raw obs_encoder_t handles are needed, not `context` (freed
+	 * right after this function returns), so deferring is safe. */
 	for (int i = 0; i < MAX_AUDIO_MIXES; i++) {
-		obs_encoder_release(context->audioEncoder[i]);
+		run_destroy_queued((obs_task_t)obs_encoder_release, context->audioEncoder[i]);
 		context->audioEncoder[i] = NULL;
 	}
-	obs_encoder_release(context->encoder);
+	run_destroy_queued((obs_task_t)obs_encoder_release, context->encoder);
 	context->encoder = NULL;
 
 	pthread_mutex_lock(&context->audio_source_mutex);
@@ -1789,6 +1865,13 @@ static void source_record_filter_destroy(void *data)
 	}
 
 	context->source = NULL;
+
+	/* Must run after every other release above (the output releases at
+	 * the top of this function are async too, on the same queue) and
+	 * right before the actual free -- see wait_for_destroy_queue_drain's
+	 * own comment for why this is the fix for a real cross-thread UAF,
+	 * not just belt-and-suspenders. */
+	wait_for_destroy_queue_drain();
 	bfree(context);
 }
 
