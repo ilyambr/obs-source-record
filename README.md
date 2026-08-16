@@ -22,6 +22,8 @@ https://www.paypal.me/exeldro
 
 # Changes
 
+0.4.25 - unfroze OBS again. turns out 0.4.16's freeze fix only covered the output; the ENCODER teardown (the actual NVENC/hardware session, not just a memory free) was still happening on OBS's shared render thread the whole time, so disabling a filter (or a scene switch that hides then quickly re-shows its source) could still freeze the whole program for ~20s, with your stream's bitrate dropping to 0 for the duration since nothing else sharing that thread could render either. also found and fixed a second copy of the same freeze hiding in filter removal specifically. and while moving the encoder teardown to its own background thread, introduced (and then fixed, same day) a genuine use-after-free if you removed a filter while an earlier one of these teardowns was still in flight - found by an automated review, not a crash report, for once.
+
 0.4.16 - unfroze OBS. yes it was actually freezing your whole program for 30 whole seconds if you disabled a filter mid-replay-buffer, we just never told you why. also taught the filter to snitch on itself (new get_record_status thing) so other plugins can ask "hey are you recording" instead of guessing. also the DLL was straight up lying about its own version number this whole time (kept saying 0.4.13 no matter what we shipped) - it has been informed it is in fact 0.4.16 now
 
 0.4.14 - plugged a leak. an output that got torn down before it ever actually started (thanks, rapid duration-slider dragging and DPI-scaled window capture) never got freed, so it just sat there hoarding frames forever. if your replay buffer was mysteriously eating double-digit gigabytes, this was you, sorry
