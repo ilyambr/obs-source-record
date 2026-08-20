@@ -2046,41 +2046,74 @@ static void source_record_chapter_hotkey(void *data, obs_hotkey_id id, obs_hotke
 	calldata_free(&cd);
 }
 
-// True only if `parent` has a real scene item somewhere -- any scene in the
-// collection, not just whichever one happens to be live on program right
-// now -- and every one of those items has its eye icon toggled off.
+// True if `parent` counts as hidden right now. If the source has a real
+// scene item in whatever scene is CURRENTLY LIVE, that item's own eye icon
+// is the whole answer -- other, non-live scenes it also happens to sit in
+// don't matter. Only when the source isn't part of the current scene at all
+// does this fall back to checking every scene it does appear in, requiring
+// all of them hidden.
 //
-// This USED to check only the current program scene, and treated "not
-// present in that scene at all" as hidden too (see the old comment this
-// replaced: "Not being in that scene at all counts as hidden too"). That
-// was a real, confirmed bug, not just a theoretical edge case: it meant
-// switching to ANY other scene -- one that simply doesn't happen to contain
-// this particular source -- paused its recording exactly as if the user had
-// hidden it on purpose, purely because of which scene was live. Confirmed
-// live from a user's log: two Source Record'd sources living in different
-// scenes, rapid switching between those scenes produced 56 real start/stop
-// cycles of their filters within one session, none of which were the user
-// actually hiding anything via an eye icon. Worse than just choppy files:
-// the eye-icon-disable side effect below (obs_source_set_enabled) also
-// stops the REPLAY BUFFER, not just file recording -- so this was silently
-// resetting the buffer's whole rolling window on every scene switch too.
-// This directly undermines the entire point of Source Record, which
-// deliberately forces obs_source_inc_showing() on its own parent
-// specifically so it keeps producing real frames independent of whatever
-// scene happens to be live (see filter_needs_video_pipeline's own comment).
-// "Hide the source" -- the literal feature this is named after, per its own
-// changelog entry -- means the eye icon, in whichever scene(s) the source
-// actually lives in, not "isn't part of the current program scene."
+// That fallback exists because this USED to check only the current program
+// scene unconditionally, and treated "not present in that scene at all" as
+// hidden too (see the old comment this replaced: "Not being in that scene
+// at all counts as hidden too"). That was a real, confirmed bug, not just a
+// theoretical edge case: it meant switching to ANY other scene -- one that
+// simply doesn't happen to contain this particular source -- paused its
+// recording exactly as if the user had hidden it on purpose, purely because
+// of which scene was live. Confirmed live from a user's log: two Source
+// Record'd sources living in different scenes, rapid switching between
+// those scenes produced 56 real start/stop cycles of their filters within
+// one session, none of which were the user actually hiding anything via an
+// eye icon. Worse than just choppy files: the eye-icon-disable side effect
+// below (obs_source_set_enabled) also stops the REPLAY BUFFER, not just
+// file recording -- so this was silently resetting the buffer's whole
+// rolling window on every scene switch too. This directly undermines the
+// entire point of Source Record, which deliberately forces
+// obs_source_inc_showing() on its own parent specifically so it keeps
+// producing real frames independent of whatever scene happens to be live
+// (see filter_needs_video_pipeline's own comment).
+//
+// The all-scenes fallback alone then produced the opposite complaint,
+// also confirmed live: a source hidden (eye off) in the current live scene
+// kept recording anyway, because it was still visible in some other,
+// non-live scene it also appeared in -- requiring the eye off in every
+// scene at once before anything paused. Checking the current scene FIRST
+// (when the source is actually in it) fixes that without reintroducing the
+// original bug, since "not in the current scene" still falls through to
+// the conservative all-hidden check instead of assuming hidden.
 static bool source_toggled_off_everywhere(obs_source_t *parent)
 {
+	const char *name = obs_source_get_name(parent);
+	if (!name)
+		return false;
+
+	// The current live scene, if the source actually appears in it, wins
+	// outright: its own eye icon there is the whole answer, regardless of
+	// what the source is doing in any other, non-live scene it also
+	// happens to sit in. Without this, a source visibly hidden on program
+	// right now would keep recording forever unless every OTHER scene it
+	// appears in also had it hidden -- confirmed as a real live complaint,
+	// not a theoretical one. Only falls through to the all-scenes check
+	// below when the source isn't part of the current scene at all, since
+	// then there's no live eye icon to defer to.
+	obs_source_t *current_scene_source = obs_frontend_get_current_scene();
+	if (current_scene_source) {
+		obs_scene_t *current_scene = obs_scene_from_source(current_scene_source);
+		obs_sceneitem_t *current_item = current_scene ? obs_scene_find_source_recursive(current_scene, name) : NULL;
+		bool found_in_current = current_item != NULL;
+		bool hidden_in_current = found_in_current && !obs_sceneitem_visible(current_item);
+		obs_source_release(current_scene_source);
+		if (found_in_current)
+			return hidden_in_current;
+	}
+
 	struct obs_frontend_source_list scenes = {0};
 	obs_frontend_get_scenes(&scenes);
 
-	const char *name = obs_source_get_name(parent);
 	bool found_any = false;
 	bool all_hidden = true;
 
-	for (size_t i = 0; name && i < scenes.sources.num; i++) {
+	for (size_t i = 0; i < scenes.sources.num; i++) {
 		obs_scene_t *scene = obs_scene_from_source(scenes.sources.array[i]);
 		if (!scene)
 			continue;
