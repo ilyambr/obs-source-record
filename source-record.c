@@ -1272,8 +1272,22 @@ static void update_encoder(struct source_record_filter_context *filter, obs_data
 		audio_output_open(&filter->audio_output, &oi);
 	}
 
-	if (!filter->audioEncoder[0] || filter->audio_track != audio_track ||
-	    (audio_track == AUDIO_TRACK_CUSTOM && filter->audio_track_mask != audio_track_mask)) {
+	bool any_audio_encoder_active = false;
+	for (int i = 0; i < MAX_AUDIO_MIXES; i++) {
+		if (filter->audioEncoder[i] && obs_encoder_active(filter->audioEncoder[i])) {
+			any_audio_encoder_active = true;
+			break;
+		}
+	}
+	/* Fix: an active audio encoder is never released here, same reason as
+	 * the video encoder's own guard above -- releasing an in-use encoder
+	 * caused crashes (confirmed via a real OBS crash dump: heap corruption
+	 * surfacing later on an unrelated thread, the classic symptom of
+	 * tearing down memory something else is still actively writing into).
+	 * It gets swapped once idle instead, the next time this runs after the
+	 * consuming output(s) have stopped. */
+	if (!any_audio_encoder_active && (!filter->audioEncoder[0] || filter->audio_track != audio_track ||
+	    (audio_track == AUDIO_TRACK_CUSTOM && filter->audio_track_mask != audio_track_mask))) {
 		for (int i = 0; i < MAX_AUDIO_MIXES; i++) {
 			if (!filter->audioEncoder[i])
 				continue;
@@ -1334,9 +1348,12 @@ static void update_encoder(struct source_record_filter_context *filter, obs_data
 			if (filter->replayOutput && !obs_output_active(filter->replayOutput))
 				obs_output_set_audio_encoder(filter->replayOutput, filter->audioEncoder[i], i);
 		}
+		filter->audio_track = audio_track;
+		filter->audio_track_mask = audio_track_mask;
 	}
-	filter->audio_track = audio_track;
-	filter->audio_track_mask = audio_track_mask;
+	/* If any_audio_encoder_active skipped the block above, filter->audio_track
+	 * is deliberately left stale so this whole check fires again next update,
+	 * once the encoder(s) actually go idle -- see the comment above. */
 }
 
 /* Rebuilds the private overlay scene from the reference scene's items, copying
