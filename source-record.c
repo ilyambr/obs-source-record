@@ -1322,9 +1322,16 @@ static void update_encoder(struct source_record_filter_context *filter, obs_data
 			if (filter->audio_output)
 				obs_encoder_set_audio(filter->audioEncoder[i], filter->audio_output);
 
-			if (filter->fileOutput)
+			/* libobs rejects obs_output_set_audio_encoder on an output that's
+			 * still active (it logs a warning and does nothing), which used to
+			 * happen silently here: the encoders above just got recreated, but
+			 * an in-progress record/replay output would keep its OLD encoder
+			 * wired in, desynced from filter->audioEncoder[i] from this point
+			 * on. Skip the swap while the output's live; it naturally picks up
+			 * the new encoder the next time it (re)starts. */
+			if (filter->fileOutput && !obs_output_active(filter->fileOutput))
 				obs_output_set_audio_encoder(filter->fileOutput, filter->audioEncoder[i], i);
-			if (filter->replayOutput)
+			if (filter->replayOutput && !obs_output_active(filter->replayOutput))
 				obs_output_set_audio_encoder(filter->replayOutput, filter->audioEncoder[i], i);
 		}
 	}
