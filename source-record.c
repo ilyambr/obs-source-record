@@ -2061,7 +2061,7 @@ static bool source_hidden_in_current_scene(obs_source_t *parent)
 
 	// If the parent source itself is disabled or deactivated (e.g. Video Capture Device deactivated),
 	// consider it hidden/inactive immediately without waiting for a scene transition.
-	if (!obs_source_enabled(parent) || !obs_source_active(parent))
+	if (!obs_source_enabled(parent) || !obs_source_active(parent) || !obs_source_get_width(parent) || !obs_source_get_height(parent))
 		return true;
 
 	obs_source_t *current_scene_source = obs_frontend_get_current_scene();
