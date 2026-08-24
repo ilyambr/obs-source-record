@@ -1272,8 +1272,22 @@ static void update_encoder(struct source_record_filter_context *filter, obs_data
 		audio_output_open(&filter->audio_output, &oi);
 	}
 
-	if (!filter->audioEncoder[0] || filter->audio_track != audio_track ||
-	    (audio_track == AUDIO_TRACK_CUSTOM && filter->audio_track_mask != audio_track_mask)) {
+	bool any_audio_encoder_active = false;
+	for (int i = 0; i < MAX_AUDIO_MIXES; i++) {
+		if (filter->audioEncoder[i] && obs_encoder_active(filter->audioEncoder[i])) {
+			any_audio_encoder_active = true;
+			break;
+		}
+	}
+	/* Fix: an active audio encoder is never released here, same reason as
+	 * the video encoder's own guard above -- releasing an in-use encoder
+	 * caused crashes (confirmed via a real OBS crash dump: heap corruption
+	 * surfacing later on an unrelated thread, the classic symptom of
+	 * tearing down memory something else is still actively writing into).
+	 * It gets swapped once idle instead, the next time this runs after the
+	 * consuming output(s) have stopped. */
+	if (!any_audio_encoder_active && (!filter->audioEncoder[0] || filter->audio_track != audio_track ||
+	    (audio_track == AUDIO_TRACK_CUSTOM && filter->audio_track_mask != audio_track_mask))) {
 		for (int i = 0; i < MAX_AUDIO_MIXES; i++) {
 			if (!filter->audioEncoder[i])
 				continue;
@@ -1322,14 +1336,24 @@ static void update_encoder(struct source_record_filter_context *filter, obs_data
 			if (filter->audio_output)
 				obs_encoder_set_audio(filter->audioEncoder[i], filter->audio_output);
 
-			if (filter->fileOutput)
+			/* libobs rejects obs_output_set_audio_encoder on an output that's
+			 * still active (it logs a warning and does nothing), which used to
+			 * happen silently here: the encoders above just got recreated, but
+			 * an in-progress record/replay output would keep its OLD encoder
+			 * wired in, desynced from filter->audioEncoder[i] from this point
+			 * on. Skip the swap while the output's live; it naturally picks up
+			 * the new encoder the next time it (re)starts. */
+			if (filter->fileOutput && !obs_output_active(filter->fileOutput))
 				obs_output_set_audio_encoder(filter->fileOutput, filter->audioEncoder[i], i);
-			if (filter->replayOutput)
+			if (filter->replayOutput && !obs_output_active(filter->replayOutput))
 				obs_output_set_audio_encoder(filter->replayOutput, filter->audioEncoder[i], i);
 		}
+		filter->audio_track = audio_track;
+		filter->audio_track_mask = audio_track_mask;
 	}
-	filter->audio_track = audio_track;
-	filter->audio_track_mask = audio_track_mask;
+	/* If any_audio_encoder_active skipped the block above, filter->audio_track
+	 * is deliberately left stale so this whole check fires again next update,
+	 * once the encoder(s) actually go idle -- see the comment above. */
 }
 
 /* Rebuilds the private overlay scene from the reference scene's items, copying
@@ -2022,67 +2046,37 @@ static void source_record_chapter_hotkey(void *data, obs_hotkey_id id, obs_hotke
 	calldata_free(&cd);
 }
 
-// True only if `parent` has a real scene item somewhere -- any scene in the
-// collection, not just whichever one happens to be live on program right
-// now -- and every one of those items has its eye icon toggled off.
-//
-// This USED to check only the current program scene, and treated "not
-// present in that scene at all" as hidden too (see the old comment this
-// replaced: "Not being in that scene at all counts as hidden too"). That
-// was a real, confirmed bug, not just a theoretical edge case: it meant
-// switching to ANY other scene -- one that simply doesn't happen to contain
-// this particular source -- paused its recording exactly as if the user had
-// hidden it on purpose, purely because of which scene was live. Confirmed
-// live from a user's log: two Source Record'd sources living in different
-// scenes, rapid switching between those scenes produced 56 real start/stop
-// cycles of their filters within one session, none of which were the user
-// actually hiding anything via an eye icon. Worse than just choppy files:
-// the eye-icon-disable side effect below (obs_source_set_enabled) also
-// stops the REPLAY BUFFER, not just file recording -- so this was silently
-// resetting the buffer's whole rolling window on every scene switch too.
-// This directly undermines the entire point of Source Record, which
-// deliberately forces obs_source_inc_showing() on its own parent
-// specifically so it keeps producing real frames independent of whatever
-// scene happens to be live (see filter_needs_video_pipeline's own comment).
-// "Hide the source" -- the literal feature this is named after, per its own
-// changelog entry -- means the eye icon, in whichever scene(s) the source
-// actually lives in, not "isn't part of the current program scene."
-static bool source_toggled_off_everywhere(obs_source_t *parent)
+// True if `parent` is hidden or not present in the currently live/program scene.
+// If the parent source IS the current live scene itself, it is considered visible.
+// If the source has a real scene item in the current scene, its eye icon decides.
+// If the source is not in the current scene at all, it is considered hidden.
+static bool source_hidden_in_current_scene(obs_source_t *parent)
 {
-	struct obs_frontend_source_list scenes = {0};
-	obs_frontend_get_scenes(&scenes);
-
 	const char *name = obs_source_get_name(parent);
-	bool found_any = false;
-	bool all_hidden = true;
+	if (!name)
+		return false;
 
-	for (size_t i = 0; name && i < scenes.sources.num; i++) {
-		obs_scene_t *scene = obs_scene_from_source(scenes.sources.array[i]);
-		if (!scene)
-			continue;
-		obs_sceneitem_t *item = obs_scene_find_source_recursive(scene, name);
-		if (!item)
-			continue;
-		found_any = true;
-		if (obs_sceneitem_visible(item)) {
-			all_hidden = false;
-			break;
-		}
+	obs_source_t *current_scene_source = obs_frontend_get_current_scene();
+	if (!current_scene_source)
+		return false; // no info available; don't force a change either way
+
+	// If the filter is attached directly to the current scene itself:
+	if (parent == current_scene_source) {
+		obs_source_release(current_scene_source);
+		return false;
 	}
 
-	obs_frontend_source_list_free(&scenes);
-	// No scene item anywhere (e.g. a source that was removed from every
-	// scene but the filter's own parent reference is still alive) isn't
-	// "hidden" in any meaningful sense either -- nothing to have an eye
-	// icon on, so nothing is actually toggling it off.
-	return found_any && all_hidden;
+	obs_scene_t *current_scene = obs_scene_from_source(current_scene_source);
+	obs_sceneitem_t *current_item = current_scene ? obs_scene_find_source_recursive(current_scene, name) : NULL;
+	bool hidden = current_item ? !obs_sceneitem_visible(current_item) : true;
+	obs_source_release(current_scene_source);
+	return hidden;
 }
 
 // Forces record_mode to None (and disables the filter itself, for the eye
-// icon -- see below) while the source is toggled off everywhere it appears
-// (source_toggled_off_everywhere's own comment), and restores both once
-// it's shown again (record_mode staying None if that's what it already
-// was).
+// icon -- see below) while the source is hidden in the current scene, and
+// restores both once it's shown again (record_mode staying None if that's
+// what it already was).
 //
 // Enforces the invariant every 0.5s, not just once on the hidden/shown
 // TRANSITION -- the previous version wrote the new record_mode exactly once
@@ -2104,7 +2098,7 @@ static void update_hidden_record_mode(struct source_record_filter_context *conte
 		return;
 	context->visibility_check_accum = 0.0f;
 
-	const bool hidden = source_toggled_off_everywhere(parent);
+	const bool hidden = source_hidden_in_current_scene(parent);
 	context->source_hidden_in_scene = hidden;
 
 	// Keeps the filter's own eye icon in the Filters list in sync with

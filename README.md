@@ -22,6 +22,8 @@ https://www.paypal.me/exeldro
 
 # Changes
 
+0.4.28 - strictly evaluate the current live/program scene for visibility: if a source is not in the active scene (or has its eye icon toggled off in the active scene), its recording/replay buffer is paused immediately rather than checking inactive background scenes.
+
 0.4.27 - fixed a real bug where switching to literally any OTHER scene could pause your recording and reset your replay buffer, even if you never touched an eye icon. Turns out "hide the source" was quietly being interpreted as "isn't in the scene that's currently live" instead of "the eye icon is actually off" - so if your recorded source lived in a different scene than whatever was on program, every scene change paused it, and rapid scene switching (confirmed live: 56 start/stop cycles from one user in a single session) hammered the encoder over and over for no reason. Now it only pauses when the eye icon is actually off, checked across every scene the source appears in, not just the live one.
 
 0.4.26 - get_record_status can now tell you a source has no actual signal (capture card unplugged, no window selected, nothing hooked) instead of just "not recording", so external docks (Backtrack, obs-replay-slider's control panel) can show that clearly instead of you clicking Start and it silently arming itself for nothing.
