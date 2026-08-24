@@ -667,9 +667,12 @@ static void get_record_status_proc(void *data, calldata_t *cd)
 static void get_replay_buffer_status_proc(void *data, calldata_t *cd)
 {
 	struct source_record_filter_context *context = data;
+	obs_source_t *parent = obs_filter_get_parent(context->source);
 	calldata_set_bool(cd, "enabled", context->replayBuffer);
 	calldata_set_bool(cd, "active", context->replayOutput && obs_output_active(context->replayOutput));
 	calldata_set_bool(cd, "error", context->replay_error);
+	calldata_set_bool(cd, "hidden", context->source_hidden_in_scene);
+	calldata_set_bool(cd, "no_signal", parent && (!obs_source_get_width(parent) || !obs_source_get_height(parent) || !obs_source_active(parent)));
 
 	struct dstr hotkey_str;
 	dstr_init(&hotkey_str);
@@ -1787,7 +1790,7 @@ static void *source_record_filter_create(obs_data_t *settings, obs_source_t *sou
 
 	proc_handler_t *ph = obs_source_get_proc_handler(source);
 	if (ph) {
-		proc_handler_add(ph, "void get_replay_buffer_status(out bool enabled, out bool active, out bool error, out string hotkey)",
+		proc_handler_add(ph, "void get_replay_buffer_status(out bool enabled, out bool active, out bool error, out bool hidden, out bool no_signal, out string hotkey)",
 				 get_replay_buffer_status_proc, context);
 		proc_handler_add(ph, "void save_replay_buffer(out bool success)", save_replay_buffer_proc, context);
 		proc_handler_add(
@@ -2055,6 +2058,11 @@ static bool source_hidden_in_current_scene(obs_source_t *parent)
 	const char *name = obs_source_get_name(parent);
 	if (!name)
 		return false;
+
+	// If the parent source itself is disabled or deactivated (e.g. Video Capture Device deactivated),
+	// consider it hidden/inactive immediately without waiting for a scene transition.
+	if (!obs_source_enabled(parent) || !obs_source_active(parent))
+		return true;
 
 	obs_source_t *current_scene_source = obs_frontend_get_current_scene();
 	if (!current_scene_source)

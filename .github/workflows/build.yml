@@ -300,5 +300,6 @@ jobs:
           path: package/*.exe
       - name: Remove temp artifacts
         uses: geekyeggo/delete-artifact@v4.1.0
+        continue-on-error: true
         with:
           name: "${{ env.FILE_NAME_X86 }}\n${{ env.FILE_NAME_X64 }}"
