@@ -487,6 +487,19 @@ static void *remux_worker_thread(void *arg)
 	wchar_t search_buf[MAX_PATH];
 	if (SearchPathW(NULL, L"ffmpeg.exe", NULL, MAX_PATH, search_buf, NULL)) {
 		wcsncpy(ffmpeg_exe, search_buf, MAX_PATH);
+	} else {
+		const wchar_t *candidates[] = {
+			L"C:\\ffmpeg\\ffmpeg-9.0.1-essentials_build\\bin\\ffmpeg.exe",
+			L"C:\\ffmpeg\\bin\\ffmpeg.exe",
+			L"C:\\Program Files\\ffmpeg\\bin\\ffmpeg.exe",
+			L"C:\\ProgramData\\chocolatey\\bin\\ffmpeg.exe",
+		};
+		for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
+			if (GetFileAttributesW(candidates[i]) != INVALID_FILE_ATTRIBUTES) {
+				wcsncpy(ffmpeg_exe, candidates[i], MAX_PATH);
+				break;
+			}
+		}
 	}
 
 	wchar_t cmd_line[4096];
@@ -4047,6 +4060,16 @@ static bool save_replay_buffer_source(obs_source_t *source, obs_data_t *request_
 	calldata_t cd = {0};
 	bool success = proc_handler_call(ph, "save", &cd);
 	calldata_free(&cd);
+
+	if (context->replayOutput_overlay) {
+		proc_handler_t *pho = obs_output_get_proc_handler(context->replayOutput_overlay);
+		if (pho) {
+			calldata_t cdo = {0};
+			proc_handler_call(pho, "save", &cdo);
+			calldata_free(&cdo);
+		}
+	}
+
 	if (!success)
 		blog(LOG_WARNING, "[Source Record] replay_buffer_save proc call failed");
 	else
