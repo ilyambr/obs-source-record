@@ -2,9 +2,10 @@ name: build obs plugin
 
 on:
   push:
-    branches: [ master ]
+    branches: [ master, dual-video-tracks ]
   pull_request:
     branches: [ master ]
+  workflow_dispatch:
 
 env:
   PLUGIN_NAME: source-record
