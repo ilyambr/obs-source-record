@@ -7,8 +7,12 @@
 #include "version.h"
 #include "obs-websocket-api.h"
 
-#ifndef _WIN32
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#else
 #include <dlfcn.h>
+#include <unistd.h>
 #endif
 
 #define OUTPUT_MODE_NONE 0
@@ -530,11 +534,11 @@ static void *remux_worker_thread(void *arg)
 	dstr_free(&cmd);
 
 	if (ret == 0) {
-		unlink(task->overlay_path);
-		rename(temp_path, task->clean_path);
+		os_unlink(task->overlay_path);
+		os_rename(temp_path, task->clean_path);
 		blog(LOG_INFO, "[Source Record] Dual video track remux succeeded: '%s'", task->clean_path);
 	} else {
-		unlink(temp_path);
+		os_unlink(temp_path);
 		blog(LOG_WARNING, "[Source Record] FFmpeg dual track remux failed with exit code %d; keeping original and overlay tracks separate", ret);
 	}
 #endif
